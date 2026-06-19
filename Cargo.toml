@@ -1,0 +1,20 @@
+[package]
+name = "lazytesla"
+version = "0.1.0"
+edition = "2024"
+description = "Manage your Tesla from the terminal"
+license = "MIT"
+
+[dependencies]
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+directories = "5"
+open = "5"
+rand = "0.8"
+ratatui = "0.30.1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+url = "2"
