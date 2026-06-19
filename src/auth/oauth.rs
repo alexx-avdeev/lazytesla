@@ -114,3 +114,37 @@ impl OAuthClient {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::OAuthClient;
+    use crate::config::Config;
+
+    fn test_config() -> Config {
+        Config {
+            client_id: "test-client".into(),
+            client_secret: "test-secret".into(),
+            redirect_uri: "http://localhost:8484/callback".into(),
+            audience: "https://fleet-api.prd.na.vn.cloud.tesla.com".into(),
+            callback_port: 8484,
+            domain: Some("example.com".into()),
+        }
+    }
+
+    #[test]
+    fn authorize_url_includes_required_oauth_params() {
+        let client = OAuthClient::new(test_config());
+        let url = client.authorize_url("test-state");
+
+        assert!(url.starts_with("https://auth.tesla.com/oauth2/v3/authorize"));
+        assert!(url.contains("client_id=test-client"));
+        assert!(url.contains("response_type=code"));
+        assert!(url.contains("state=test-state"));
+        assert!(url.contains("prompt_missing_scopes=true"));
+    }
+
+    #[test]
+    fn generate_state_is_32_characters() {
+        assert_eq!(OAuthClient::generate_state().len(), 32);
+    }
+}

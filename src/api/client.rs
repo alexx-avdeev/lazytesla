@@ -12,9 +12,13 @@ pub struct FleetClient {
 
 impl FleetClient {
     pub fn new(base_url: String) -> Self {
+        Self::with_http(base_url, Client::new())
+    }
+
+    pub fn with_http(base_url: String, http: Client) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            http: Client::new(),
+            http,
         }
     }
 
@@ -93,4 +97,27 @@ pub fn needs_partner_registration(message: &str) -> bool {
     lower.contains("must be registered")
         || lower.contains("unregistered account")
         || lower.contains("partner_accounts")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{needs_partner_registration, parse_error_message};
+
+    #[test]
+    fn parses_api_error_with_description() {
+        let body = r#"{"error":"invalid_request","error_description":"Account must be registered"}"#;
+        assert_eq!(
+            parse_error_message(body),
+            Some("invalid_request: Account must be registered".into())
+        );
+    }
+
+    #[test]
+    fn detects_registration_required_errors() {
+        assert!(needs_partner_registration(
+            "Account must be registered in the current region"
+        ));
+        assert!(needs_partner_registration("Unregistered account"));
+        assert!(!needs_partner_registration("vehicle is asleep"));
+    }
 }

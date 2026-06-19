@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
 use crate::app::{App, VehiclesStatus};
+use crate::util::mask_vin;
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -189,21 +190,6 @@ fn wrap_message(message: &str, width: usize) -> Vec<String> {
         }
     }
     lines
-}
-
-fn mask_vin(vin: &str) -> String {
-    let chars: Vec<char> = vin.chars().collect();
-    match chars.len() {
-        0 => String::new(),
-        1 | 2 => vin.to_string(),
-        len => {
-            let mut masked = String::with_capacity(len);
-            masked.push(chars[0]);
-            masked.extend(std::iter::repeat_n('*', len - 2));
-            masked.push(chars[len - 1]);
-            masked
-        }
-    }
 }
 
 fn state_style(state: &str) -> Style {

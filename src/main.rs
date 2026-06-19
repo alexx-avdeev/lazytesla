@@ -1,23 +1,18 @@
-mod api;
-mod app;
-mod auth;
-mod config;
-mod error;
-mod tui;
-
 use std::time::Duration;
 
-use api::Vehicle;
-use app::{fetch_vehicles, App, Screen};
-use auth::oauth::{OAuthClient, TokenSet};
-use auth::server::CallbackServer;
-use error::{AppError, Result};
+use lazytesla::api::Vehicle;
+use lazytesla::app::{fetch_vehicles, App, Screen};
+use lazytesla::auth::oauth::{OAuthClient, TokenSet};
+use lazytesla::auth::server::CallbackServer;
+use lazytesla::config::Config;
+use lazytesla::error::{AppError, Result};
+use lazytesla::tui;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = match config::Config::from_env() {
+    let config = match Config::from_env() {
         Ok(config) => config,
         Err(err) => {
             eprintln!("{err}");
@@ -33,7 +28,7 @@ async fn main() -> Result<()> {
     result
 }
 
-async fn run(terminal: &mut ratatui::DefaultTerminal, config: config::Config) -> Result<()> {
+async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<()> {
     let mut app = App::new(config).await?;
     let (auth_tx, mut auth_rx) = mpsc::unbounded_channel::<Result<TokenSet>>();
     let (vehicles_tx, mut vehicles_rx) = mpsc::unbounded_channel::<Result<Vec<Vehicle>>>();

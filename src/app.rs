@@ -1,7 +1,6 @@
 use chrono::{DateTime, Utc};
 
-use crate::api::{needs_partner_registration, FleetClient, Vehicle};
-use crate::auth::partner::PartnerAuth;
+use crate::api::{FleetApi, Vehicle};
 use crate::auth::oauth::{OAuthClient, TokenSet};
 use crate::auth::store::{StoredTokens, TokenStore};
 use crate::config::Config;
@@ -211,32 +210,106 @@ pub struct VehicleLoadRequest {
 }
 
 pub async fn fetch_vehicles(request: VehicleLoadRequest) -> Result<Vec<Vehicle>> {
-    let client = FleetClient::new(request.config.audience.clone());
-
-    if let Some(domain) = &request.config.domain {
-        register_partner_if_needed(&client, &request.config, domain).await?;
-    }
-
-    match client.list_vehicles(&request.access_token).await {
-        Ok(vehicles) => Ok(vehicles),
-        Err(err) if needs_partner_registration(&err.to_string()) => {
-            let Some(domain) = &request.config.domain else {
-                return Err(AppError::Config(request.config.registration_help()));
-            };
-
-            register_partner_if_needed(&client, &request.config, domain).await?;
-            client.list_vehicles(&request.access_token).await
-        }
-        Err(err) => Err(err),
-    }
+    FleetApi::from_config(&request.config)
+        .fetch_vehicles(&request.config, &request.access_token)
+        .await
 }
 
-async fn register_partner_if_needed(
-    client: &FleetClient,
-    config: &Config,
-    domain: &str,
-) -> Result<()> {
-    let partner_auth = PartnerAuth::new(config.clone());
-    let partner_token = partner_auth.partner_token().await?;
-    client.register_partner(&partner_token, domain).await
+#[cfg(test)]
+mod tests {
+    use crate::api::Vehicle;
+    use crate::auth::oauth::OAuthClient;
+    use crate::auth::store::TokenStore;
+    use crate::config::Config;
+    use crate::error::AppError;
+
+    use super::*;
+
+    fn test_config() -> Config {
+        Config {
+            client_id: "test-client".into(),
+            client_secret: "test-secret".into(),
+            redirect_uri: "http://localhost:8484/callback".into(),
+            audience: "https://fleet-api.prd.na.vn.cloud.tesla.com".into(),
+            callback_port: 8484,
+            domain: Some("example.com".into()),
+        }
+    }
+
+    fn test_app() -> App {
+        App {
+            screen: Screen::Home,
+            auth_status: AuthStatus::Authenticated,
+            tokens: None,
+            status_message: String::new(),
+            vehicles: vec![
+                Vehicle {
+                    id: "1".into(),
+                    vin: "5YJSA11111111111".into(),
+                    display_name: "Car 1".into(),
+                    state: "online".into(),
+                    in_service: false,
+                },
+                Vehicle {
+                    id: "2".into(),
+                    vin: "5YJSA22222222222".into(),
+                    display_name: "Car 2".into(),
+                    state: "asleep".into(),
+                    in_service: false,
+                },
+            ],
+            vehicles_status: VehiclesStatus::Loaded,
+            selected_vehicle: 0,
+            config: test_config(),
+            oauth: OAuthClient::new(test_config()),
+            token_store: TokenStore::with_path(std::env::temp_dir().join("lazytesla-app-test.json")),
+            pending_state: None,
+        }
+    }
+
+    #[test]
+    fn apply_vehicles_updates_loaded_state() {
+        let mut app = test_app();
+        app.apply_vehicles(Ok(vec![Vehicle {
+            id: "9".into(),
+            vin: "5YJSA99999999999".into(),
+            display_name: "Roadster".into(),
+            state: "offline".into(),
+            in_service: true,
+        }]));
+
+        assert_eq!(app.vehicles.len(), 1);
+        assert_eq!(app.vehicles_status, VehiclesStatus::Loaded);
+        assert_eq!(app.status_message, "Loaded 1 vehicle(s)");
+        assert_eq!(app.selected_vehicle, 0);
+    }
+
+    #[test]
+    fn apply_vehicles_records_errors() {
+        let mut app = test_app();
+        app.apply_vehicles(Err(AppError::Api("registration required".into())));
+
+        assert!(app.vehicles.is_empty());
+        assert_eq!(
+            app.vehicles_status,
+            VehiclesStatus::Error("API error: registration required".into())
+        );
+    }
+
+    #[test]
+    fn vehicle_selection_wraps_within_bounds() {
+        let mut app = test_app();
+
+        app.select_next_vehicle();
+        assert_eq!(app.selected_vehicle, 1);
+
+        app.select_next_vehicle();
+        assert_eq!(app.selected_vehicle, 1);
+
+        app.select_previous_vehicle();
+        assert_eq!(app.selected_vehicle, 0);
+
+        app.select_previous_vehicle();
+        assert_eq!(app.selected_vehicle, 0);
+    }
 }

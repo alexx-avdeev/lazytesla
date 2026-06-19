@@ -4,7 +4,7 @@ use serde::Deserialize;
 use crate::config::Config;
 use crate::error::{AppError, Result};
 
-const TOKEN_URL: &str = "https://fleet-auth.prd.vn.cloud.tesla.com/oauth2/v3/token";
+pub const TOKEN_URL: &str = "https://fleet-auth.prd.vn.cloud.tesla.com/oauth2/v3/token";
 const PARTNER_SCOPES: &str = "openid";
 
 #[derive(Debug, Deserialize)]
@@ -15,20 +15,26 @@ struct PartnerTokenResponse {
 pub struct PartnerAuth {
     config: Config,
     http: Client,
+    token_url: String,
 }
 
 impl PartnerAuth {
     pub fn new(config: Config) -> Self {
+        Self::with_options(config, Client::new(), TOKEN_URL.to_string())
+    }
+
+    pub fn with_options(config: Config, http: Client, token_url: String) -> Self {
         Self {
             config,
-            http: Client::new(),
+            http,
+            token_url,
         }
     }
 
     pub async fn partner_token(&self) -> Result<String> {
         let response = self
             .http
-            .post(TOKEN_URL)
+            .post(&self.token_url)
             .form(&[
                 ("grant_type", "client_credentials"),
                 ("client_id", self.config.client_id.as_str()),

@@ -77,4 +77,43 @@ impl TokenStore {
     pub fn is_expired(tokens: &StoredTokens) -> bool {
         tokens.expires_at <= Utc::now()
     }
+
+    #[cfg(test)]
+    pub fn with_path(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Duration;
+
+    use super::{StoredTokens, TokenStore};
+
+    #[test]
+    fn saves_and_loads_tokens() {
+        let dir = std::env::temp_dir().join(format!("lazytesla-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join("tokens.json");
+        let store = TokenStore::with_path(path);
+        let tokens = StoredTokens {
+            access_token: "access".into(),
+            refresh_token: "refresh".into(),
+            expires_at: chrono::Utc::now() + Duration::hours(1),
+        };
+
+        store.save(&tokens).unwrap();
+        let loaded = store.load().unwrap().expect("tokens should exist");
+
+        assert_eq!(loaded.access_token, "access");
+        assert_eq!(loaded.refresh_token, "refresh");
+        assert!(!TokenStore::is_expired(&loaded));
+
+        store.clear().unwrap();
+        assert!(store.load().unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
