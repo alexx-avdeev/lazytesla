@@ -2,6 +2,8 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::api::debug_curl;
+use crate::api::details::{VehicleDataResponse, VehicleDetails};
 use crate::api::vehicles::{Vehicle, VehiclesResponse};
 use crate::error::{AppError, Result};
 
@@ -24,12 +26,23 @@ impl FleetClient {
 
     pub async fn register_partner(&self, partner_token: &str, domain: &str) -> Result<()> {
         let url = format!("{}/api/1/partner_accounts", self.base_url);
+        let body = json!({ "domain": domain }).to_string();
+        let auth = format!("Bearer {partner_token}");
+        debug_curl::log_post_json(
+            &url,
+            &[
+                ("Authorization", auth.as_str()),
+                ("Content-Type", "application/json"),
+            ],
+            &body,
+        );
+
         let response = self
             .http
             .post(&url)
-            .header("Authorization", format!("Bearer {partner_token}"))
+            .header("Authorization", auth)
             .header("Content-Type", "application/json")
-            .json(&json!({ "domain": domain }))
+            .body(body)
             .send()
             .await?;
 
@@ -45,12 +58,56 @@ impl FleetClient {
         Err(AppError::Api(format!("{message}: {body}")))
     }
 
-    pub async fn list_vehicles(&self, access_token: &str) -> Result<Vec<Vehicle>> {
-        let url = format!("{}/api/1/vehicles", self.base_url);
+    pub async fn get_vehicle_data(&self, vin: &str, access_token: &str) -> Result<VehicleDetails> {
+        let url = format!("{}/api/1/vehicles/{vin}/vehicle_data", self.base_url);
+        let auth = format!("Bearer {access_token}");
+        debug_curl::log_get(
+            &url,
+            &[
+                ("Authorization", auth.as_str()),
+                ("Content-Type", "application/json"),
+            ],
+        );
+
         let response = self
             .http
             .get(&url)
-            .header("Authorization", format!("Bearer {access_token}"))
+            .header("Authorization", auth)
+            .header("Content-Type", "application/json")
+            .send()
+            .await?;
+
+        let status = response.status();
+        let body = response.text().await?;
+
+        if !status.is_success() {
+            let message = parse_error_message(&body)
+                .unwrap_or_else(|| format!("request failed ({status})"));
+            return Err(AppError::Api(format!("{message}: {body}")));
+        }
+
+        let parsed: VehicleDataResponse = serde_json::from_str(&body).map_err(|err| {
+            AppError::Api(format!("failed to parse vehicle data response: {err}: {body}"))
+        })?;
+
+        Ok(VehicleDetails::from_raw(parsed.response))
+    }
+
+    pub async fn list_vehicles(&self, access_token: &str) -> Result<Vec<Vehicle>> {
+        let url = format!("{}/api/1/vehicles", self.base_url);
+        let auth = format!("Bearer {access_token}");
+        debug_curl::log_get(
+            &url,
+            &[
+                ("Authorization", auth.as_str()),
+                ("Content-Type", "application/json"),
+            ],
+        );
+
+        let response = self
+            .http
+            .get(&url)
+            .header("Authorization", auth)
             .header("Content-Type", "application/json")
             .send()
             .await?;

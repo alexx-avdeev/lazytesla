@@ -29,6 +29,35 @@ fn mock_fleet_api(mock: &MockServer) -> FleetApi {
     )
 }
 
+fn vehicle_data_response() -> serde_json::Value {
+    serde_json::json!({
+        "response": {
+            "vin": "5YJSA11111111111",
+            "state": "online",
+            "vehicle_state": {
+                "vehicle_name": "Nikola 2.0",
+                "odometer": 12345.0,
+                "locked": true,
+                "car_version": "2024.8.9"
+            },
+            "charge_state": {
+                "battery_level": 80,
+                "charging_state": "Complete",
+                "battery_range": 250.0,
+                "charge_limit_soc": 90
+            },
+            "climate_state": {
+                "inside_temp": 22.0,
+                "outside_temp": 0.0,
+                "is_climate_on": false
+            },
+            "gui_settings": {
+                "gui_temperature_units": "F"
+            }
+        }
+    })
+}
+
 fn vehicles_response() -> serde_json::Value {
     serde_json::json!({
         "response": [{
@@ -172,6 +201,134 @@ async fn fetch_vehicles_returns_config_error_without_domain() {
         .expect_err("missing domain should return config error");
 
     assert!(err.to_string().contains("TESLA_DOMAIN"));
+}
+
+#[tokio::test]
+async fn get_vehicle_data_parses_vehicle_state_name() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/1/vehicles/5YJSA11111111111/vehicle_data"))
+        .and(header("Authorization", "Bearer user-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vehicle_data_response()))
+        .mount(&server)
+        .await;
+
+    let client = FleetClient::with_http(server.uri(), Client::new());
+    let details = client
+        .get_vehicle_data("5YJSA11111111111", "user-token")
+        .await
+        .expect("vehicle data should succeed");
+
+    assert_eq!(details.display_name, "Nikola 2.0");
+    assert_eq!(details.battery_level, Some(80));
+    assert_eq!(details.odometer, Some(12345.0));
+    assert!((details.inside_temp.unwrap() - 71.6).abs() < 0.01);
+    assert_eq!(details.display_temperature_unit(), "F");
+}
+
+#[tokio::test]
+async fn refresh_vehicles_fetches_details_for_each_vehicle() {
+    let server = MockServer::start().await;
+    mock_partner_token(&server).await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/1/partner_accounts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "response": { "account_id": "registered" }
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/1/vehicles"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vehicles_response()))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/1/vehicles/5YJSA11111111111/vehicle_data"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vehicle_data_response()))
+        .mount(&server)
+        .await;
+
+    let api = mock_fleet_api(&server);
+    let config = test_config(&server.uri(), Some("example.com"));
+
+    let refresh = api
+        .refresh_vehicles(&config, "user-token")
+        .await
+        .expect("refresh should list vehicles and fetch details");
+
+    assert_eq!(refresh.vehicles.len(), 1);
+    assert_eq!(refresh.details.len(), 1);
+    assert_eq!(
+        refresh.details.get("5YJSA11111111111").unwrap().display_name,
+        "Nikola 2.0"
+    );
+}
+
+#[tokio::test]
+async fn refresh_vehicles_keeps_partial_details_when_one_fetch_fails() {
+    let server = MockServer::start().await;
+    mock_partner_token(&server).await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/1/partner_accounts"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "response": { "account_id": "registered" }
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/1/vehicles"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "response": [
+                {
+                    "id_s": "1",
+                    "vin": "5YJSA11111111111",
+                    "display_name": "Car 1",
+                    "state": "online",
+                    "in_service": false
+                },
+                {
+                    "id_s": "2",
+                    "vin": "5YJSA22222222222",
+                    "display_name": "Car 2",
+                    "state": "asleep",
+                    "in_service": false
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/1/vehicles/5YJSA11111111111/vehicle_data"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vehicle_data_response()))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/api/1/vehicles/5YJSA22222222222/vehicle_data"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+            "error": "vehicle unavailable"
+        })))
+        .mount(&server)
+        .await;
+
+    let api = mock_fleet_api(&server);
+    let config = test_config(&server.uri(), Some("example.com"));
+
+    let refresh = api
+        .refresh_vehicles(&config, "user-token")
+        .await
+        .expect("refresh should succeed with partial details");
+
+    assert_eq!(refresh.vehicles.len(), 2);
+    assert_eq!(refresh.details.len(), 1);
+    assert!(refresh.details.contains_key("5YJSA11111111111"));
 }
 
 #[tokio::test]
