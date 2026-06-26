@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use lazytesla::api::Vehicle;
-use lazytesla::app::{fetch_vehicles, App, Screen};
+use lazytesla::api::VehicleRefreshResult;
+use lazytesla::app::{refresh_vehicles, App, Screen};
 use lazytesla::auth::oauth::{OAuthClient, TokenSet};
 use lazytesla::auth::server::CallbackServer;
 use lazytesla::config::Config;
@@ -31,10 +31,11 @@ async fn main() -> Result<()> {
 async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<()> {
     let mut app = App::new(config).await?;
     let (auth_tx, mut auth_rx) = mpsc::unbounded_channel::<Result<TokenSet>>();
-    let (vehicles_tx, mut vehicles_rx) = mpsc::unbounded_channel::<Result<Vec<Vehicle>>>();
+    let (refresh_tx, mut refresh_rx) =
+        mpsc::unbounded_channel::<Result<VehicleRefreshResult>>();
 
     if app.is_authenticated() {
-        request_vehicle_load(&mut app, vehicles_tx.clone());
+        request_vehicle_refresh(&mut app, refresh_tx.clone());
     }
 
     loop {
@@ -46,15 +47,15 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<
                     if let Err(err) = app.set_authenticated(tokens).await {
                         app.set_error(err);
                     } else {
-                        request_vehicle_load(&mut app, vehicles_tx.clone());
+                        request_vehicle_refresh(&mut app, refresh_tx.clone());
                     }
                 }
                 Err(err) => app.set_error(err),
             }
         }
 
-        if let Ok(result) = vehicles_rx.try_recv() {
-            app.apply_vehicles(result);
+        if let Ok(result) = refresh_rx.try_recv() {
+            app.apply_vehicle_refresh(result);
         }
 
         if event::poll(Duration::from_millis(100))? {
@@ -76,7 +77,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<
                         }
                     }
                     KeyCode::Char('r') if app.screen == Screen::Home => {
-                        request_vehicle_load(&mut app, vehicles_tx.clone());
+                        request_vehicle_refresh(&mut app, refresh_tx.clone());
                     }
                     KeyCode::Up | KeyCode::Char('k') if app.screen == Screen::Home => {
                         app.select_previous_vehicle();
@@ -93,16 +94,19 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<
     Ok(())
 }
 
-fn request_vehicle_load(app: &mut App, vehicles_tx: mpsc::UnboundedSender<Result<Vec<Vehicle>>>) {
+fn request_vehicle_refresh(
+    app: &mut App,
+    refresh_tx: mpsc::UnboundedSender<Result<VehicleRefreshResult>>,
+) {
     let Some(request) = app.vehicle_load_request() else {
         return;
     };
 
-    app.begin_vehicle_load();
+    app.begin_vehicle_refresh();
 
     tokio::spawn(async move {
-        let result = fetch_vehicles(request).await;
-        let _ = vehicles_tx.send(result);
+        let result = refresh_vehicles(request).await;
+        let _ = refresh_tx.send(result);
     });
 }
 

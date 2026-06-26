@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+
+use crate::api::details::VehicleDetails;
 use crate::api::{needs_partner_registration, FleetClient, Vehicle};
 use crate::auth::partner::PartnerAuth;
 use crate::config::Config;
@@ -6,6 +9,12 @@ use crate::error::{AppError, Result};
 pub struct FleetApi {
     fleet: FleetClient,
     partner: PartnerAuth,
+}
+
+#[derive(Debug, Clone)]
+pub struct VehicleRefreshResult {
+    pub vehicles: Vec<Vehicle>,
+    pub details: HashMap<String, VehicleDetails>,
 }
 
 impl FleetApi {
@@ -18,6 +27,30 @@ impl FleetApi {
 
     pub fn with_clients(fleet: FleetClient, partner: PartnerAuth) -> Self {
         Self { fleet, partner }
+    }
+
+    pub async fn refresh_vehicles(
+        &self,
+        config: &Config,
+        access_token: &str,
+    ) -> Result<VehicleRefreshResult> {
+        let vehicles = self.fetch_vehicles(config, access_token).await?;
+        let mut details = HashMap::new();
+
+        for vehicle in &vehicles {
+            match self
+                .fleet
+                .get_vehicle_data(&vehicle.vin, access_token)
+                .await
+            {
+                Ok(detail) => {
+                    details.insert(vehicle.vin.clone(), detail);
+                }
+                Err(_) => {}
+            }
+        }
+
+        Ok(VehicleRefreshResult { vehicles, details })
     }
 
     pub async fn fetch_vehicles(&self, config: &Config, access_token: &str) -> Result<Vec<Vehicle>> {
