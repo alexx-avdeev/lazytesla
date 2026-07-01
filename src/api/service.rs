@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::api::commands::ClimateAction;
 use crate::api::details::VehicleDetails;
 use crate::api::{needs_partner_registration, FleetClient, Vehicle};
 use crate::auth::partner::PartnerAuth;
@@ -8,7 +9,9 @@ use crate::error::{AppError, Result};
 
 pub struct FleetApi {
     fleet: FleetClient,
+    command: FleetClient,
     partner: PartnerAuth,
+    proxy_configured: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -18,15 +21,22 @@ pub struct VehicleRefreshResult {
 }
 
 impl FleetApi {
-    pub fn from_config(config: &Config) -> Self {
-        Self {
+    pub fn from_config(config: &Config) -> Result<Self> {
+        Ok(Self {
             fleet: FleetClient::new(config.audience.clone()),
+            command: FleetClient::for_config(config)?,
             partner: PartnerAuth::new(config.clone()),
-        }
+            proxy_configured: config.command_proxy_url.is_some(),
+        })
     }
 
-    pub fn with_clients(fleet: FleetClient, partner: PartnerAuth) -> Self {
-        Self { fleet, partner }
+    pub fn with_clients(fleet: FleetClient, command: FleetClient, partner: PartnerAuth) -> Self {
+        Self {
+            fleet,
+            command,
+            partner,
+            proxy_configured: true,
+        }
     }
 
     pub async fn refresh_vehicles(
@@ -75,5 +85,21 @@ impl FleetApi {
     pub async fn register_partner(&self, domain: &str) -> Result<()> {
         let partner_token = self.partner.partner_token().await?;
         self.fleet.register_partner(&partner_token, domain).await
+    }
+
+    pub async fn send_climate_command(
+        &self,
+        vin: &str,
+        action: ClimateAction,
+        access_token: &str,
+    ) -> Result<()> {
+        self.command
+            .send_command(
+                vin,
+                action.command_name(),
+                access_token,
+                self.proxy_configured,
+            )
+            .await
     }
 }

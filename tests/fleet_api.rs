@@ -13,6 +13,8 @@ fn test_config(base_url: &str, domain: Option<&str>) -> Config {
         audience: base_url.into(),
         callback_port: 8484,
         domain: domain.map(str::to_string),
+        command_proxy_url: None,
+        command_proxy_ca_cert: None,
     }
 }
 
@@ -20,6 +22,7 @@ fn mock_fleet_api(mock: &MockServer) -> FleetApi {
     let base = mock.uri();
     let config = test_config(&base, Some("example.com"));
     FleetApi::with_clients(
+        FleetClient::with_http(base.clone(), Client::new()),
         FleetClient::with_http(base.clone(), Client::new()),
         PartnerAuth::with_options(
             config,
@@ -193,7 +196,7 @@ async fn fetch_vehicles_returns_config_error_without_domain() {
         .await;
 
     let config = test_config(&server.uri(), None);
-    let api = FleetApi::from_config(&config);
+    let api = FleetApi::from_config(&config).expect("config should be valid");
 
     let err = api
         .fetch_vehicles(&config, "user-token")
@@ -266,6 +269,80 @@ async fn refresh_vehicles_fetches_details_for_each_vehicle() {
         refresh.details.get("5YJSA11111111111").unwrap().display_name,
         "Nikola 2.0"
     );
+}
+
+#[tokio::test]
+async fn auto_conditioning_start_sends_command() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/1/vehicles/5YJSA11111111111/command/auto_conditioning_start"))
+        .and(header("Authorization", "Bearer user-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "response": { "result": true, "reason": "" }
+        })))
+        .mount(&server)
+        .await;
+
+    let api = mock_fleet_api(&server);
+
+    api.send_climate_command(
+        "5YJSA11111111111",
+        lazytesla::api::ClimateAction::Start,
+        "user-token",
+    )
+    .await
+    .expect("climate start should succeed");
+}
+
+#[tokio::test]
+async fn auto_conditioning_stop_sends_command() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/1/vehicles/5YJSA11111111111/command/auto_conditioning_stop"))
+        .and(header("Authorization", "Bearer user-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "response": { "result": true, "reason": "" }
+        })))
+        .mount(&server)
+        .await;
+
+    let api = mock_fleet_api(&server);
+
+    api.send_climate_command(
+        "5YJSA11111111111",
+        lazytesla::api::ClimateAction::Stop,
+        "user-token",
+    )
+    .await
+    .expect("climate stop should succeed");
+}
+
+#[tokio::test]
+async fn vehicle_command_returns_api_error_when_rejected() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/1/vehicles/5YJSA11111111111/command/auto_conditioning_start"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "response": { "result": false, "reason": "vehicle unavailable" }
+        })))
+        .mount(&server)
+        .await;
+
+    let client = FleetClient::with_http(server.uri(), Client::new());
+    let err = client
+        .send_command(
+            "5YJSA11111111111",
+            "auto_conditioning_start",
+            "user-token",
+            true,
+        )
+        .await
+        .expect_err("rejected command should fail");
+
+    assert!(err.to_string().contains("vehicle unavailable"));
 }
 
 #[tokio::test]

@@ -128,6 +128,8 @@ mod tests {
             audience: "https://fleet-api.prd.na.vn.cloud.tesla.com".into(),
             callback_port: 8484,
             domain: Some("example.com".into()),
+            command_proxy_url: None,
+            command_proxy_ca_cert: None,
         }
     }
 
