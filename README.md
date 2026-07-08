@@ -127,8 +127,13 @@ mkdir -p config
 openssl req -x509 -nodes -newkey ec \
   -pkeyopt ec_paramgen_curve:secp384r1 \
   -subj '/CN=localhost' \
-  -keyout config/tls-key.pem -out config/tls-cert.pem -sha256 -days 3650
+  -keyout config/tls-key.pem -out config/tls-cert.pem -sha256 -days 3650 \
+  -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1' \
+  -addext 'basicConstraints=CA:FALSE' \
+  -addext 'extendedKeyUsage=serverAuth'
 ```
+
+Use a **server** certificate (`CA:FALSE`), not OpenSSL's default CA cert. The SAN entries let clients verify `https://127.0.0.1:4443` without disabling TLS checks.
 
 ### 3. Run the proxy (separate terminal)
 
@@ -148,18 +153,12 @@ export TESLA_COMMAND_PROXY_URL=https://127.0.0.1:4443
 export TESLA_COMMAND_PROXY_CA_CERT="/Users/you/Development/Learning/lazytesla/config/tls-cert.pem"
 ```
 
-`TESLA_COMMAND_PROXY_CA_CERT` is required when the proxy URL is set (confirms you've generated `tls-cert.pem`). LazyTesla trusts the local self-signed proxy certificate and allows the `localhost` / `127.0.0.1` hostname mismatch automatically.
+`TESLA_COMMAND_PROXY_CA_CERT` is required when the proxy URL is set. LazyTesla adds that PEM as the only trusted root for the proxy client — full certificate verification, no TLS bypass.
 
 **Test the proxy** (a `403` with "client did not provide an OAuth token" means TLS is working):
 
 ```bash
-# --cacert alone is not enough: the cert CN is "localhost", not "127.0.0.1"
-curl -sk --cacert config/tls-cert.pem https://127.0.0.1:4443/api/1/vehicles
-
-# Or keep strict cert checks and map localhost → 127.0.0.1:
-curl -s --cacert config/tls-cert.pem \
-  --resolve localhost:4443:127.0.0.1 \
-  https://localhost:4443/api/1/vehicles
+curl -s --cacert config/tls-cert.pem https://127.0.0.1:4443/api/1/vehicles
 ```
 
 Then run LazyTesla and use **`c`** to toggle climate.

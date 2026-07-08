@@ -34,21 +34,27 @@ impl FleetClient {
     }
 
     pub fn with_tls(base_url: String, ca_cert_path: Option<&str>) -> Result<Self> {
-        // tesla-http-proxy uses a self-signed tls-cert.pem (CN=localhost), not a CA.
-        // reqwest cannot load it via add_root_certificate (CaUsedAsEndEntity).
-        // The local proxy is user-operated; trust it when TESLA_COMMAND_PROXY_CA_CERT is set.
-        if let Some(path) = ca_cert_path {
-            std::fs::read(path).map_err(|err| {
-                AppError::Config(format!(
-                    "failed to read TESLA_COMMAND_PROXY_CA_CERT at {}: {err}",
-                    path
-                ))
-            })?;
-        }
+        let path = ca_cert_path.ok_or_else(|| {
+            AppError::Config(
+                "TESLA_COMMAND_PROXY_CA_CERT is required when TESLA_COMMAND_PROXY_URL is set"
+                    .into(),
+            )
+        })?;
+
+        let pem = std::fs::read(path).map_err(|err| {
+            AppError::Config(format!(
+                "failed to read TESLA_COMMAND_PROXY_CA_CERT at {path}: {err}"
+            ))
+        })?;
+
+        let cert = reqwest::Certificate::from_pem(&pem).map_err(|err| {
+            AppError::Config(format!(
+                "invalid PEM in TESLA_COMMAND_PROXY_CA_CERT ({path}): {err}"
+            ))
+        })?;
 
         let http = Client::builder()
-            .danger_accept_invalid_certs(true)
-            .danger_accept_invalid_hostnames(true)
+            .add_root_certificate(cert)
             .build()?;
         Ok(Self::with_http(base_url, http))
     }
@@ -256,14 +262,20 @@ fn format_proxy_http_error(err: reqwest::Error) -> AppError {
     let lower = details.to_ascii_lowercase();
 
     // rustls reports handshake/cert failures as Connect errors; check TLS first.
-    if lower.contains("certificate")
-        || lower.contains("causedasendentity")
-        || lower.contains("invalidcertificate")
-    {
+    if lower.contains("causedasendentity") {
+        return AppError::Config(
+            "TLS certificate rejected: tls-cert.pem was generated as a CA certificate \
+             (CA:TRUE). Regenerate it as a server certificate with SAN entries for \
+             localhost and 127.0.0.1 — see README step 2 — then restart tesla-http-proxy."
+                .into(),
+        );
+    }
+
+    if lower.contains("certificate") || lower.contains("invalidcertificate") {
         return AppError::Config(format!(
             "TLS error connecting to command proxy: {details}. \
-             Rebuild lazytesla after setting TESLA_COMMAND_PROXY_CA_CERT to your proxy \
-             tls-cert.pem path. Use TESLA_COMMAND_PROXY_URL=https://127.0.0.1:4443."
+             Ensure TESLA_COMMAND_PROXY_CA_CERT points to your proxy tls-cert.pem and \
+             TESLA_COMMAND_PROXY_URL=https://127.0.0.1:4443."
         ));
     }
 
@@ -330,5 +342,16 @@ mod tests {
         );
         assert!(matches!(err, AppError::Config(_)));
         assert!(err.to_string().contains("TESLA_COMMAND_PROXY_URL"));
+    }
+
+    #[test]
+    fn with_tls_builds_from_server_certificate_pem() {
+        let cert_path = format!("{}/config/tls-cert.pem", env!("CARGO_MANIFEST_DIR"));
+        if !std::path::Path::new(&cert_path).exists() {
+            return;
+        }
+
+        let client = super::FleetClient::with_tls("https://127.0.0.1:4443".into(), Some(&cert_path));
+        assert!(client.is_ok(), "{}", client.err().unwrap());
     }
 }
