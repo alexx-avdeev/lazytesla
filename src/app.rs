@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use crate::api::{FleetApi, Vehicle, VehicleDetails, VehicleRefreshResult};
+use crate::api::{ClimateAction, FleetApi, Vehicle, VehicleDetails, VehicleRefreshResult};
 use crate::auth::oauth::{OAuthClient, TokenSet};
 use crate::auth::store::{StoredTokens, TokenStore};
 use crate::config::Config;
@@ -207,6 +207,46 @@ impl App {
         })
     }
 
+    pub fn climate_toggle_request(&self) -> Option<ClimateCommandRequest> {
+        let vehicle = self.selected_vehicle()?;
+        let access_token = self.tokens.as_ref()?.access_token.clone();
+        let climate_on = self
+            .selected_vehicle_details()
+            .and_then(|details| details.climate_on);
+        let action = ClimateAction::from_climate_on(climate_on);
+
+        Some(ClimateCommandRequest {
+            config: self.config.clone(),
+            access_token,
+            vin: vehicle.vin.clone(),
+            action,
+        })
+    }
+
+    pub fn begin_climate_command(&mut self, action: ClimateAction) {
+        self.status_message = match action {
+            ClimateAction::Start => "Turning climate on...".into(),
+            ClimateAction::Stop => "Turning climate off...".into(),
+        };
+    }
+
+    pub fn apply_climate_command(&mut self, vin: &str, result: Result<ClimateAction>) {
+        match result {
+            Ok(action) => {
+                if let Some(details) = self.vehicle_details_cache.get_mut(vin) {
+                    details.climate_on = Some(action.climate_on());
+                }
+                self.status_message = match action {
+                    ClimateAction::Start => "Climate turned on".into(),
+                    ClimateAction::Stop => "Climate turned off".into(),
+                };
+            }
+            Err(err) => {
+                self.status_message = err.to_string();
+            }
+        }
+    }
+
     pub fn select_previous_vehicle(&mut self) {
         if self.vehicles.is_empty() {
             return;
@@ -256,16 +296,44 @@ pub struct VehicleLoadRequest {
 }
 
 pub async fn refresh_vehicles(request: VehicleLoadRequest) -> Result<VehicleRefreshResult> {
-    FleetApi::from_config(&request.config)
-        .refresh_vehicles(&request.config, &request.access_token)
+    let api = FleetApi::from_config(&request.config)?;
+    api.refresh_vehicles(&request.config, &request.access_token)
         .await
+}
+
+#[derive(Debug, Clone)]
+pub struct ClimateCommandRequest {
+    pub config: Config,
+    pub access_token: String,
+    pub vin: String,
+    pub action: ClimateAction,
+}
+
+#[derive(Debug)]
+pub struct ClimateCommandOutcome {
+    pub vin: String,
+    pub result: Result<ClimateAction>,
+}
+
+pub async fn send_climate_command(request: ClimateCommandRequest) -> ClimateCommandOutcome {
+    let vin = request.vin.clone();
+    let action = request.action;
+    let result = match FleetApi::from_config(&request.config) {
+        Ok(api) => api
+            .send_climate_command(&request.vin, action, &request.access_token)
+            .await
+            .map(|()| action),
+        Err(err) => Err(err),
+    };
+
+    ClimateCommandOutcome { vin, result }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::api::Vehicle;
     use crate::auth::oauth::OAuthClient;
-    use crate::auth::store::TokenStore;
+    use crate::auth::store::{StoredTokens, TokenStore};
     use crate::config::Config;
     use crate::error::AppError;
 
@@ -279,6 +347,8 @@ mod tests {
             audience: "https://fleet-api.prd.na.vn.cloud.tesla.com".into(),
             callback_port: 8484,
             domain: Some("example.com".into()),
+            command_proxy_url: None,
+            command_proxy_ca_cert: None,
         }
     }
 
@@ -286,7 +356,11 @@ mod tests {
         App {
             screen: Screen::Home,
             auth_status: AuthStatus::Authenticated,
-            tokens: None,
+            tokens: Some(StoredTokens {
+                access_token: "test-token".into(),
+                refresh_token: "test-refresh".into(),
+                expires_at: Utc::now() + chrono::Duration::hours(1),
+            }),
             status_message: String::new(),
             vehicles: vec![
                 Vehicle {
@@ -369,6 +443,107 @@ mod tests {
             app.vehicles_status,
             VehiclesStatus::Error("API error: registration required".into())
         );
+    }
+
+    #[test]
+    fn climate_toggle_request_starts_when_climate_off() {
+        let mut app = test_app();
+        let fetched_at = Utc::now();
+        app.vehicle_details_cache.insert(
+            "5YJSA11111111111".into(),
+            VehicleDetails {
+                vin: "5YJSA11111111111".into(),
+                display_name: "Car 1".into(),
+                state: "online".into(),
+                in_service: false,
+                battery_level: None,
+                charging_state: None,
+                battery_range: None,
+                charge_limit_soc: None,
+                locked: None,
+                odometer: None,
+                car_version: None,
+                inside_temp: None,
+                outside_temp: None,
+                climate_on: Some(false),
+                temperature_units: None,
+                fetched_at,
+            },
+        );
+
+        let request = app.climate_toggle_request().expect("request should exist");
+
+        assert_eq!(request.action, ClimateAction::Start);
+        assert_eq!(request.vin, "5YJSA11111111111");
+    }
+
+    #[test]
+    fn climate_toggle_request_stops_when_climate_on() {
+        let mut app = test_app();
+        let fetched_at = Utc::now();
+        app.vehicle_details_cache.insert(
+            "5YJSA11111111111".into(),
+            VehicleDetails {
+                vin: "5YJSA11111111111".into(),
+                display_name: "Car 1".into(),
+                state: "online".into(),
+                in_service: false,
+                battery_level: None,
+                charging_state: None,
+                battery_range: None,
+                charge_limit_soc: None,
+                locked: None,
+                odometer: None,
+                car_version: None,
+                inside_temp: None,
+                outside_temp: None,
+                climate_on: Some(true),
+                temperature_units: None,
+                fetched_at,
+            },
+        );
+
+        let request = app.climate_toggle_request().expect("request should exist");
+
+        assert_eq!(request.action, ClimateAction::Stop);
+    }
+
+    #[test]
+    fn apply_climate_command_updates_cached_state() {
+        let mut app = test_app();
+        let fetched_at = Utc::now();
+        app.vehicle_details_cache.insert(
+            "5YJSA11111111111".into(),
+            VehicleDetails {
+                vin: "5YJSA11111111111".into(),
+                display_name: "Car 1".into(),
+                state: "online".into(),
+                in_service: false,
+                battery_level: None,
+                charging_state: None,
+                battery_range: None,
+                charge_limit_soc: None,
+                locked: None,
+                odometer: None,
+                car_version: None,
+                inside_temp: None,
+                outside_temp: None,
+                climate_on: Some(false),
+                temperature_units: None,
+                fetched_at,
+            },
+        );
+
+        app.apply_climate_command("5YJSA11111111111", Ok(ClimateAction::Start));
+
+        assert_eq!(
+            app.vehicle_details_cache
+                .get("5YJSA11111111111")
+                .unwrap()
+                .climate_on,
+            Some(true)
+        );
+        assert_eq!(app.status_message, "Climate turned on");
     }
 
     #[test]

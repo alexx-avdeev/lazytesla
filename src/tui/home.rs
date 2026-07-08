@@ -245,11 +245,12 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         .map(|time| time.format("%Y-%m-%d %H:%M:%S UTC").to_string())
         .unwrap_or_else(|| "not cached".into());
 
-    let text = vec![
-        Line::from(app.status_message.as_str()),
-        Line::from(format!("Details cached: {cache_age}")),
-        Line::from(format!("Token expires: {expires}")),
-    ];
+    let mut text: Vec<Line<'_>> = wrap_message(&app.status_message, 72)
+        .into_iter()
+        .map(Line::from)
+        .collect();
+    text.push(Line::from(format!("Details cached: {cache_age}")));
+    text.push(Line::from(format!("Token expires: {expires}")));
 
     let paragraph = Paragraph::new(text)
         .block(Block::default().borders(Borders::ALL).title("Status"))
@@ -266,6 +267,8 @@ fn draw_footer(frame: &mut Frame, area: Rect) {
         Span::raw(" down   "),
         Span::styled("r", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" refresh   "),
+        Span::styled("c", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" climate   "),
         Span::styled("l", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" logout   "),
         Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
