@@ -205,7 +205,3 @@ tests/
 ## Regions
 
 Default audience is North America (`fleet-api.prd.na.vn.cloud.tesla.com`). For other regions, set `TESLA_AUDIENCE` to the appropriate Fleet API URL from [Tesla's regional documentation](https://developer.tesla.com/docs/fleet-api/getting-started/regions-countries).
-
-## License
-
-MIT
