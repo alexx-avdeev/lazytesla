@@ -101,6 +101,39 @@ impl Signer {
         Ok(buf)
     }
 
+    pub fn update_signed_session_info(
+        &mut self,
+        challenge: &[u8],
+        encoded_info: &[u8],
+        tag: &[u8],
+    ) -> Result<()> {
+        let valid_tag = self
+            .session
+            .session_info_hmac(&self.verifier_name, challenge, encoded_info)?;
+        if !constant_time_eq(&valid_tag, tag) {
+            return Err(VehicleCommandError::Crypto("session info hmac invalid".into()));
+        }
+        let info = SessionInfo::decode(encoded_info)?;
+        self.update_session_info(&info)
+    }
+
+    fn update_session_info(&mut self, info: &SessionInfo) -> Result<()> {
+        if info.public_key != self.verifier_public_bytes {
+            return Err(VehicleCommandError::Crypto(
+                "session info public key mismatch".into(),
+            ));
+        }
+        if self.epoch != epoch_bytes(info) || self.set_time <= info.clock_time {
+            if self.counter < info.counter {
+                self.counter = info.counter;
+            }
+            self.epoch = epoch_bytes(info);
+            self.set_time = info.clock_time;
+            self.time_zero = epoch_start_time(info.clock_time);
+        }
+        Ok(())
+    }
+
     pub fn authorize_hmac(&mut self, message: &mut RoutableMessage, expires_in: Duration) -> Result<()> {
         self.counter = self
             .counter
@@ -280,18 +313,56 @@ pub fn request_id(message: &RoutableMessage) -> Option<Vec<u8>> {
     }
 }
 
-pub fn routable_message_error(message: &RoutableMessage) -> Option<VehicleCommandError> {
-    let fault = message
+pub fn message_fault_code(message: &RoutableMessage) -> i32 {
+    message
         .signed_message_status
         .as_ref()
         .map(|s| s.signed_message_fault)
-        .unwrap_or(MessageFaultE::MessagefaultErrorNone as i32);
+        .unwrap_or(MessageFaultE::MessagefaultErrorNone as i32)
+}
+
+pub fn is_retriable_fault(fault: i32) -> bool {
+    matches!(
+        fault,
+        x if x == MessageFaultE::MessagefaultErrorBusy as i32
+            || x == MessageFaultE::MessagefaultErrorTimeout as i32
+            || x == MessageFaultE::MessagefaultErrorInvalidSignature as i32
+            || x == MessageFaultE::MessagefaultErrorInvalidTokenOrCounter as i32
+            || x == MessageFaultE::MessagefaultErrorInternal as i32
+            || x == MessageFaultE::MessagefaultErrorIncorrectEpoch as i32
+            || x == MessageFaultE::MessagefaultErrorTimeExpired as i32
+            || x == MessageFaultE::MessagefaultErrorTimeToLiveTooLong as i32
+    )
+}
+
+fn fault_description(fault: i32) -> String {
+    match fault {
+        x if x == MessageFaultE::MessagefaultErrorInvalidTokenOrCounter as i32 => {
+            "anti-replay counter out of sync (stale session cache)".into()
+        }
+        x if x == MessageFaultE::MessagefaultErrorInvalidSignature as i32 => {
+            "invalid command signature".into()
+        }
+        x if x == MessageFaultE::MessagefaultErrorIncorrectEpoch as i32 => {
+            "session epoch mismatch".into()
+        }
+        x if x == MessageFaultE::MessagefaultErrorTimeExpired as i32 => {
+            "command expired".into()
+        }
+        x if x == MessageFaultE::MessagefaultErrorBusy as i32 => "vehicle busy".into(),
+        x if x == MessageFaultE::MessagefaultErrorTimeout as i32 => "vehicle timeout".into(),
+        other => format!("fault code {other}"),
+    }
+}
+
+pub fn routable_message_error(message: &RoutableMessage) -> Option<VehicleCommandError> {
+    let fault = message_fault_code(message);
 
     if fault != MessageFaultE::MessagefaultErrorNone as i32 {
         if fault == MessageFaultE::MessagefaultErrorUnknownKeyId as i32 {
             return Some(VehicleCommandError::KeyNotPaired);
         }
-        return Some(VehicleCommandError::VehicleFault(format!("fault code {fault}")));
+        return Some(VehicleCommandError::VehicleFault(fault_description(fault)));
     }
 
     if let Some(status) = &message.signed_message_status {
@@ -359,6 +430,13 @@ pub fn build_session_info_request(
 
 fn epoch_start_time(epoch_time: u32) -> SystemTime {
     SystemTime::now() - Duration::from_secs(epoch_time as u64)
+}
+
+fn epoch_bytes(info: &SessionInfo) -> [u8; EPOCH_ID_LENGTH] {
+    let mut epoch = [0_u8; EPOCH_ID_LENGTH];
+    let copy = info.epoch.len().min(EPOCH_ID_LENGTH);
+    epoch[..copy].copy_from_slice(&info.epoch[..copy]);
+    epoch
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {

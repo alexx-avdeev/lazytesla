@@ -1,19 +1,23 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
+
 use prost::Message;
 use rand::RngCore;
 
 use crate::vehicle_command::climate;
 use crate::vehicle_command::crypto::key::PrivateKey;
 use crate::vehicle_command::crypto::signer::{
-    self, build_outbound_message, build_session_info_request, request_id, Signer,
-    DEFAULT_EXPIRATION, FLAG_ENCRYPT_RESPONSE,
+    self, build_outbound_message, build_session_info_request, is_retriable_fault, message_fault_code,
+    request_id, Signer, DEFAULT_EXPIRATION, FLAG_ENCRYPT_RESPONSE,
 };
 use crate::vehicle_command::error::{Result, VehicleCommandError};
 use crate::vehicle_command::fleet::FleetTransport;
 use crate::vehicle_command::proto::car_server::{OperationStatusE, Response};
 use crate::vehicle_command::proto::universal_message::{Domain, RoutableMessage};
-use crate::vehicle_command::session::{process_session_response, SessionStore};
+use crate::vehicle_command::session::{process_session_response, try_sync_session_from_message, SessionStore};
+
+const MAX_COMMAND_ATTEMPTS: usize = 3;
 
 struct VinState {
     routing_address: [u8; 16],
@@ -76,6 +80,43 @@ impl VehicleCommandClient {
         access_token: &str,
         payload: Vec<u8>,
     ) -> Result<()> {
+        let mut last_err = None;
+        for attempt in 0..MAX_COMMAND_ATTEMPTS {
+            match self
+                .try_send_infotainment_action(vin, access_token, payload.clone())
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    let retriable = matches!(&err, VehicleCommandError::VehicleFault(_))
+                        && attempt + 1 < MAX_COMMAND_ATTEMPTS;
+                    if retriable {
+                        self.clear_signer(vin, Domain::Infotainment);
+                        if self
+                            .handshake(vin, access_token, Domain::Infotainment)
+                            .await
+                            .is_err()
+                        {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                        last_err = Some(err);
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            VehicleCommandError::Protocol("command failed after retries".into())
+        }))
+    }
+
+    async fn try_send_infotainment_action(
+        &mut self,
+        vin: &str,
+        access_token: &str,
+        payload: Vec<u8>,
+    ) -> Result<()> {
         self.ensure_session(vin, access_token, Domain::Infotainment)
             .await?;
 
@@ -105,6 +146,15 @@ impl VehicleCommandClient {
         let mut response = RoutableMessage::decode(response_bytes.as_slice())?;
 
         if let Some(err) = signer::routable_message_error(&response) {
+            let fault = message_fault_code(&response);
+            if is_retriable_fault(fault) {
+                if let Some(signer) = self.signer_mut(vin, Domain::Infotainment) {
+                    if try_sync_session_from_message(signer, &response) {
+                        self.persist_signer(vin, Domain::Infotainment)?;
+                        return Err(err);
+                    }
+                }
+            }
             return Err(err);
         }
 
@@ -132,7 +182,9 @@ impl VehicleCommandClient {
             }
         };
 
-        self.parse_car_server_response(&response_payload)
+        self.parse_car_server_response(&response_payload)?;
+        self.persist_signer(vin, Domain::Infotainment)?;
+        Ok(())
     }
 
     async fn handshake(&mut self, vin: &str, access_token: &str, domain: Domain) -> Result<()> {
@@ -151,11 +203,22 @@ impl VehicleCommandClient {
             .await?;
         let response = RoutableMessage::decode(response_bytes.as_slice())?;
         let signer = process_session_response(&self.private_key, vin, &response)?;
-        let exported = signer.export_session_info()?;
-        self.sessions
-            .update_vin(vin, domain, &exported)?;
+        self.persist_signer_with(vin, domain, &signer)?;
         self.store_signer(vin, domain, signer);
         Ok(())
+    }
+
+    fn persist_signer(&mut self, vin: &str, domain: Domain) -> Result<()> {
+        let exported = self
+            .signer_mut(vin, domain)
+            .ok_or_else(|| VehicleCommandError::Protocol("session not ready".into()))?
+            .export_session_info()?;
+        self.sessions.update_vin(vin, domain, &exported)
+    }
+
+    fn persist_signer_with(&mut self, vin: &str, domain: Domain, signer: &Signer) -> Result<()> {
+        let exported = signer.export_session_info()?;
+        self.sessions.update_vin(vin, domain, &exported)
     }
 
     fn parse_car_server_response(&self, payload: &[u8]) -> Result<()> {
@@ -181,6 +244,12 @@ impl VehicleCommandClient {
         }
 
         Ok(())
+    }
+
+    fn clear_signer(&mut self, vin: &str, domain: Domain) {
+        if let Some(state) = self.vin_states.get_mut(vin) {
+            state.signers.remove(&(domain as i32));
+        }
     }
 
     fn routing_address_for(&mut self, vin: &str) -> [u8; 16] {
