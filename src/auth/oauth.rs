@@ -130,6 +130,7 @@ mod tests {
             domain: Some("example.com".into()),
             command_proxy_url: None,
             command_proxy_ca_cert: None,
+            fleet_key_path: None,
         }
     }
 

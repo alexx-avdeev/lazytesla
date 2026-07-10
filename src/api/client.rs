@@ -341,7 +341,10 @@ mod tests {
             false,
         );
         assert!(matches!(err, AppError::Config(_)));
-        assert!(err.to_string().contains("TESLA_COMMAND_PROXY_URL"));
+        assert!(
+            err.to_string().contains("TESLA_FLEET_KEY")
+                || err.to_string().contains("TESLA_COMMAND_PROXY_URL")
+        );
     }
 
     #[test]

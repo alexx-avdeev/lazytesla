@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::api::commands::ClimateAction;
 use crate::api::details::VehicleDetails;
@@ -6,12 +7,15 @@ use crate::api::{needs_partner_registration, FleetClient, Vehicle};
 use crate::auth::partner::PartnerAuth;
 use crate::config::Config;
 use crate::error::{AppError, Result};
+use crate::vehicle_command::VehicleCommandClient;
+use crate::vehicle_command::VehicleCommandError;
 
 pub struct FleetApi {
     fleet: FleetClient,
     command: FleetClient,
     partner: PartnerAuth,
     proxy_configured: bool,
+    vcp: Option<VehicleCommandClient>,
 }
 
 #[derive(Debug, Clone)]
@@ -22,11 +26,21 @@ pub struct VehicleRefreshResult {
 
 impl FleetApi {
     pub fn from_config(config: &Config) -> Result<Self> {
+        let vcp = if let Some(path) = &config.fleet_key_path {
+            Some(
+                VehicleCommandClient::new(Path::new(path), &config.audience)
+                    .map_err(map_vehicle_command_error)?,
+            )
+        } else {
+            None
+        };
+
         Ok(Self {
             fleet: FleetClient::new(config.audience.clone()),
             command: FleetClient::for_config(config)?,
             partner: PartnerAuth::new(config.clone()),
             proxy_configured: config.command_proxy_url.is_some(),
+            vcp,
         })
     }
 
@@ -36,6 +50,7 @@ impl FleetApi {
             command,
             partner,
             proxy_configured: true,
+            vcp: None,
         }
     }
 
@@ -88,11 +103,19 @@ impl FleetApi {
     }
 
     pub async fn send_climate_command(
-        &self,
+        &mut self,
         vin: &str,
         action: ClimateAction,
         access_token: &str,
     ) -> Result<()> {
+        if let Some(vcp) = &mut self.vcp {
+            return match action {
+                ClimateAction::Start => vcp.climate_on(vin, access_token).await,
+                ClimateAction::Stop => vcp.climate_off(vin, access_token).await,
+            }
+            .map_err(map_vehicle_command_error);
+        }
+
         self.command
             .send_command(
                 vin,
@@ -101,5 +124,17 @@ impl FleetApi {
                 self.proxy_configured,
             )
             .await
+    }
+}
+
+fn map_vehicle_command_error(err: VehicleCommandError) -> AppError {
+    match err {
+        VehicleCommandError::KeyNotPaired => AppError::Config(
+            "vehicle does not recognize your fleet key; pair via https://tesla.com/_ak/<your_domain>"
+                .into(),
+        ),
+        VehicleCommandError::VehicleUnavailable(message) => AppError::Api(message),
+        VehicleCommandError::InvalidKey(message) => AppError::Config(message),
+        other => AppError::Api(other.to_string()),
     }
 }

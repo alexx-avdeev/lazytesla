@@ -7,7 +7,7 @@ A terminal UI for managing your Tesla via the [Tesla Fleet API](https://develope
 - OAuth sign-in with token persistence (session restore on restart)
 - Two-panel vehicle view: list on the left, cached details on the right
 - Vehicle details fetched on startup and on manual refresh
-- Climate on/off toggle (via Vehicle Command Proxy)
+- Climate on/off toggle (native Vehicle Command Protocol or optional HTTP proxy)
 - Masked VIN display
 - Optional Fleet API debug logging to a local file
 
@@ -15,7 +15,7 @@ A terminal UI for managing your Tesla via the [Tesla Fleet API](https://develope
 
 - **Rust** (2024 edition; nightly or recent stable)
 - A **Tesla developer account** and Fleet API application at [developer.tesla.com](https://developer.tesla.com)
-- **Go** (only if you want climate/commands — needed to run Tesla's [vehicle-command](https://github.com/teslamotors/vehicle-command) HTTP proxy)
+- **Go** (optional — only if you prefer Tesla's [vehicle-command](https://github.com/teslamotors/vehicle-command) HTTP proxy over native signing)
 
 ## Tesla developer setup
 
@@ -48,14 +48,18 @@ A terminal UI for managing your Tesla via the [Tesla Fleet API](https://develope
 | `TESLA_REDIRECT_URI` | no | `http://localhost:8484/callback` | OAuth redirect URI |
 | `TESLA_AUDIENCE` | no | `https://fleet-api.prd.na.vn.cloud.tesla.com` | Fleet API region base URL |
 | `TESLA_CALLBACK_PORT` | no | `8484` | Local port for OAuth callback server |
-| `TESLA_COMMAND_PROXY_URL` | no** | — | Vehicle Command Proxy URL (use `https://127.0.0.1:4443`, not `localhost`) |
-| `TESLA_COMMAND_PROXY_CA_CERT` | no** | — | Path to the proxy TLS certificate (`tls-cert.pem`) |
+| `TESLA_FLEET_KEY` | no** | — | Path to fleet private key PEM (`tesla-keygen create`); preferred for climate/commands |
+| `TESLA_KEY_FILE` | no | — | Alias for `TESLA_FLEET_KEY` |
+| `TESLA_COMMAND_PROXY_URL` | no*** | — | Vehicle Command Proxy URL (fallback; use `https://127.0.0.1:4443`, not `localhost`) |
+| `TESLA_COMMAND_PROXY_CA_CERT` | no*** | — | Path to the proxy TLS certificate (`tls-cert.pem`) |
 | `TESLA_DEBUG_CURL` | no | — | Set to `1` to log equivalent `curl` commands to a file |
 | `TESLA_DEBUG_CURL_LOG` | no | see below | Override path for the debug log file |
 
 \*Required for vehicle list/data in most regions. Without it you'll see a registration error on refresh.
 
-\**Required for climate toggle (`c`) on modern vehicles. Pre-2021 Model S/X may work without the proxy for some commands.
+\**Required for climate toggle (`c`) on modern vehicles unless you use the proxy below. Pre-2021 Model S/X may work without signed commands for some actions.
+
+\***Proxy fallback when `TESLA_FLEET_KEY` is not set. If both are set, native VCP takes priority.
 
 ### Example `.env` snippet
 
@@ -95,9 +99,22 @@ Tokens are stored at:
 
 Vehicle details are cached in memory. Switching vehicles shows cached data immediately; press `r` to fetch fresh data from the API.
 
-## Vehicle Command Proxy (climate / commands)
+## Vehicle commands (climate)
 
-Modern Teslas require commands to be signed via Tesla's [Vehicle Command Protocol](https://github.com/teslamotors/vehicle-command). LazyTesla sends climate commands through a local HTTP proxy — not directly to Fleet API.
+Modern Teslas require commands to be signed via Tesla's [Vehicle Command Protocol](https://github.com/teslamotors/vehicle-command). LazyTesla signs commands natively in Rust when `TESLA_FLEET_KEY` is set, posting directly to Fleet API `signed_command`. Session state is cached at `~/Library/Application Support/lazytesla/session_cache.json` (macOS).
+
+### Native signing (recommended)
+
+```bash
+# After tesla-keygen create (see developer setup above)
+export TESLA_FLEET_KEY="/path/to/config/fleet-key.pem"
+```
+
+No proxy process required. Pair your key on the vehicle via `https://tesla.com/_ak/<your_domain>`.
+
+## Vehicle Command Proxy (optional fallback)
+
+If you prefer Tesla's official HTTP proxy instead of native signing, LazyTesla can still route commands through it when `TESLA_FLEET_KEY` is unset.
 
 ### 1. Install the proxy
 
@@ -197,9 +214,11 @@ src/
   config.rs        # Environment configuration
   api/             # Fleet API client, vehicle data, commands
   auth/            # OAuth, token store, callback server
+  vehicle_command/ # Native Tesla Vehicle Command Protocol (signed_command)
   tui/             # ratatui screens
 tests/
   fleet_api.rs     # Integration tests
+  vehicle_command.rs # VCP signing and Fleet API wiremock tests
 ```
 
 ## Regions
