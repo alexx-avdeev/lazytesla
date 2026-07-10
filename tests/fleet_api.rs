@@ -15,6 +15,7 @@ fn test_config(base_url: &str, domain: Option<&str>) -> Config {
         domain: domain.map(str::to_string),
         command_proxy_url: None,
         command_proxy_ca_cert: None,
+        fleet_key_path: None,
     }
 }
 
@@ -284,7 +285,7 @@ async fn auto_conditioning_start_sends_command() {
         .mount(&server)
         .await;
 
-    let api = mock_fleet_api(&server);
+    let mut api = mock_fleet_api(&server);
 
     api.send_climate_command(
         "5YJSA11111111111",
@@ -308,7 +309,7 @@ async fn auto_conditioning_stop_sends_command() {
         .mount(&server)
         .await;
 
-    let api = mock_fleet_api(&server);
+    let mut api = mock_fleet_api(&server);
 
     api.send_climate_command(
         "5YJSA11111111111",

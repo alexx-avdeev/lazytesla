@@ -319,7 +319,7 @@ pub async fn send_climate_command(request: ClimateCommandRequest) -> ClimateComm
     let vin = request.vin.clone();
     let action = request.action;
     let result = match FleetApi::from_config(&request.config) {
-        Ok(api) => api
+        Ok(mut api) => api
             .send_climate_command(&request.vin, action, &request.access_token)
             .await
             .map(|()| action),
@@ -349,6 +349,7 @@ mod tests {
             domain: Some("example.com".into()),
             command_proxy_url: None,
             command_proxy_ca_cert: None,
+            fleet_key_path: None,
         }
     }
 

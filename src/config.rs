@@ -21,6 +21,7 @@ pub struct Config {
     pub domain: Option<String>,
     pub command_proxy_url: Option<String>,
     pub command_proxy_ca_cert: Option<String>,
+    pub fleet_key_path: Option<String>,
 }
 
 impl Config {
@@ -47,6 +48,11 @@ impl Config {
             .ok()
             .filter(|value| !value.is_empty())
             .map(|path| Self::expand_path(&path));
+        let fleet_key_path = std::env::var("TESLA_FLEET_KEY")
+            .or_else(|_| std::env::var("TESLA_KEY_FILE"))
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(|path| Self::expand_path(&path));
 
         let config = Self {
             client_id,
@@ -57,9 +63,11 @@ impl Config {
             domain,
             command_proxy_url,
             command_proxy_ca_cert,
+            fleet_key_path,
         };
 
         config.validate_command_proxy()?;
+        config.validate_fleet_key()?;
         Ok(config)
     }
 
@@ -117,11 +125,25 @@ impl Config {
         path.to_string()
     }
 
+    fn validate_fleet_key(&self) -> Result<()> {
+        let Some(path) = &self.fleet_key_path else {
+            return Ok(());
+        };
+
+        if !Path::new(path).is_file() {
+            return Err(AppError::Config(format!(
+                "TESLA_FLEET_KEY does not exist: {path}"
+            )));
+        }
+
+        Ok(())
+    }
+
     pub fn command_proxy_help() -> String {
-        "Vehicle commands require Tesla's Vehicle Command Proxy. \
-         Install https://github.com/teslamotors/vehicle-command, run tesla-http-proxy with your \
-         fleet private key, then set TESLA_COMMAND_PROXY_URL (e.g. https://127.0.0.1:4443) and \
-         TESLA_COMMAND_PROXY_CA_CERT to the proxy's cert.pem. \
+        "Vehicle commands require Tesla's Vehicle Command Protocol. \
+         Set TESLA_FLEET_KEY to your fleet private key PEM (from tesla-keygen create), \
+         or run tesla-http-proxy and set TESLA_COMMAND_PROXY_URL (e.g. https://127.0.0.1:4443) \
+         plus TESLA_COMMAND_PROXY_CA_CERT. \
          Pair your app key on the vehicle via https://tesla.com/_ak/<your_domain>."
             .into()
     }
