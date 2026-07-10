@@ -133,6 +133,31 @@ pub fn process_session_response(
     Signer::new_authenticated(private, vin.as_bytes(), challenge, &session_info_bytes, &tag)
 }
 
+/// Sync session state from a command error response (vehicle includes updated SessionInfo).
+pub fn try_sync_session_from_message(signer: &mut Signer, response: &RoutableMessage) -> bool {
+    let challenge = response.request_uuid.clone();
+    let session_info_bytes = match &response.payload {
+        Some(Payload::SessionInfo(bytes)) => bytes.clone(),
+        _ => return false,
+    };
+    let tag = response
+        .sub_sig_data
+        .as_ref()
+        .and_then(|sub| match sub {
+            SubSigData::SignatureData(sig) => sig.sig_type.as_ref(),
+        })
+        .and_then(|sig_type| match sig_type {
+            SigType::SessionInfoTag(data) => Some(data.tag.clone()),
+            _ => None,
+        });
+    let Some(tag) = tag else {
+        return false;
+    };
+    signer
+        .update_signed_session_info(&challenge, &session_info_bytes, &tag)
+        .is_ok()
+}
+
 mod base64_serde {
     use base64::{engine::general_purpose::STANDARD, Engine};
     use serde::{Deserialize, Deserializer, Serializer};
