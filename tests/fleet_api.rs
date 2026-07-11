@@ -297,6 +297,54 @@ async fn auto_conditioning_start_sends_command() {
 }
 
 #[tokio::test]
+async fn door_lock_sends_command() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/1/vehicles/5YJSA11111111111/command/door_lock"))
+        .and(header("Authorization", "Bearer user-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "response": { "result": true, "reason": "" }
+        })))
+        .mount(&server)
+        .await;
+
+    let mut api = mock_fleet_api(&server);
+
+    api.send_lock_command(
+        "5YJSA11111111111",
+        lazytesla::api::LockAction::Lock,
+        "user-token",
+    )
+    .await
+    .expect("door lock should succeed");
+}
+
+#[tokio::test]
+async fn door_unlock_sends_command() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/1/vehicles/5YJSA11111111111/command/door_unlock"))
+        .and(header("Authorization", "Bearer user-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "response": { "result": true, "reason": "" }
+        })))
+        .mount(&server)
+        .await;
+
+    let mut api = mock_fleet_api(&server);
+
+    api.send_lock_command(
+        "5YJSA11111111111",
+        lazytesla::api::LockAction::Unlock,
+        "user-token",
+    )
+    .await
+    .expect("door unlock should succeed");
+}
+
+#[tokio::test]
 async fn auto_conditioning_stop_sends_command() {
     let server = MockServer::start().await;
 

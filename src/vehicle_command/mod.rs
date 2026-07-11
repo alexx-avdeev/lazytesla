@@ -1,5 +1,6 @@
 pub mod climate;
 pub mod client;
+pub mod security;
 pub mod crypto;
 pub mod error;
 pub mod fleet;

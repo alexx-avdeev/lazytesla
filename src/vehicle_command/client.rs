@@ -13,11 +13,22 @@ use crate::vehicle_command::crypto::signer::{
 };
 use crate::vehicle_command::error::{Result, VehicleCommandError};
 use crate::vehicle_command::fleet::FleetTransport;
-use crate::vehicle_command::proto::car_server::{OperationStatusE, Response};
+use crate::vehicle_command::proto::car_server::{OperationStatusE as CarServerOperationStatusE, Response};
 use crate::vehicle_command::proto::universal_message::{Domain, RoutableMessage};
+use crate::vehicle_command::proto::vcsec::{
+    from_vcsec_message::SubMessage as VcsecSubMessage, FromVcsecMessage,
+    OperationStatusE as VcsecOperationStatusE,
+};
+use crate::vehicle_command::security;
 use crate::vehicle_command::session::{process_session_response, try_sync_session_from_message, SessionStore};
 
 const MAX_COMMAND_ATTEMPTS: usize = 3;
+
+#[derive(Clone, Copy)]
+enum ResponseKind {
+    CarServer,
+    Vcsec,
+}
 
 struct VinState {
     routing_address: [u8; 16],
@@ -49,11 +60,37 @@ impl VehicleCommandClient {
         self.send_climate(vin, access_token, false).await
     }
 
+    pub async fn lock(&mut self, vin: &str, access_token: &str) -> Result<()> {
+        self.send_lock_action(vin, access_token, true).await
+    }
+
+    pub async fn unlock(&mut self, vin: &str, access_token: &str) -> Result<()> {
+        self.send_lock_action(vin, access_token, false).await
+    }
+
     async fn send_climate(&mut self, vin: &str, access_token: &str, power_on: bool) -> Result<()> {
         self.fleet.wake_up(vin, access_token).await?;
         let payload = climate::build_climate_action(power_on)?;
-        self.send_infotainment_action(vin, access_token, payload)
+        self.send_domain_action(vin, access_token, Domain::Infotainment, payload, ResponseKind::CarServer)
             .await
+    }
+
+    async fn send_lock_action(
+        &mut self,
+        vin: &str,
+        access_token: &str,
+        lock: bool,
+    ) -> Result<()> {
+        self.fleet.wake_up(vin, access_token).await?;
+        let payload = security::build_rke_action(lock)?;
+        self.send_domain_action(
+            vin,
+            access_token,
+            Domain::VehicleSecurity,
+            payload,
+            ResponseKind::Vcsec,
+        )
+        .await
     }
 
     pub async fn ensure_session(&mut self, vin: &str, access_token: &str, domain: Domain) -> Result<()> {
@@ -80,10 +117,22 @@ impl VehicleCommandClient {
         access_token: &str,
         payload: Vec<u8>,
     ) -> Result<()> {
+        self.send_domain_action(vin, access_token, Domain::Infotainment, payload, ResponseKind::CarServer)
+            .await
+    }
+
+    async fn send_domain_action(
+        &mut self,
+        vin: &str,
+        access_token: &str,
+        domain: Domain,
+        payload: Vec<u8>,
+        response_kind: ResponseKind,
+    ) -> Result<()> {
         let mut last_err = None;
         for attempt in 0..MAX_COMMAND_ATTEMPTS {
             match self
-                .try_send_infotainment_action(vin, access_token, payload.clone())
+                .try_send_domain_action(vin, access_token, domain, payload.clone(), response_kind)
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -91,12 +140,8 @@ impl VehicleCommandClient {
                     let retriable = matches!(&err, VehicleCommandError::VehicleFault(_))
                         && attempt + 1 < MAX_COMMAND_ATTEMPTS;
                     if retriable {
-                        self.clear_signer(vin, Domain::Infotainment);
-                        if self
-                            .handshake(vin, access_token, Domain::Infotainment)
-                            .await
-                            .is_err()
-                        {
+                        self.clear_signer(vin, domain);
+                        if self.handshake(vin, access_token, domain).await.is_err() {
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                         last_err = Some(err);
@@ -111,19 +156,20 @@ impl VehicleCommandClient {
         }))
     }
 
-    async fn try_send_infotainment_action(
+    async fn try_send_domain_action(
         &mut self,
         vin: &str,
         access_token: &str,
+        domain: Domain,
         payload: Vec<u8>,
+        response_kind: ResponseKind,
     ) -> Result<()> {
-        self.ensure_session(vin, access_token, Domain::Infotainment)
-            .await?;
+        self.ensure_session(vin, access_token, domain).await?;
 
         let routing_address = self.routing_address_for(vin);
         let uuid = random_bytes(16);
         let mut message = build_outbound_message(
-            Domain::Infotainment,
+            domain,
             &routing_address,
             &uuid,
             payload,
@@ -132,7 +178,7 @@ impl VehicleCommandClient {
 
         {
             let signer = self
-                .signer_mut(vin, Domain::Infotainment)
+                .signer_mut(vin, domain)
                 .ok_or_else(|| VehicleCommandError::Protocol("session not ready".into()))?;
             signer.authorize_hmac(&mut message, DEFAULT_EXPIRATION)?;
         }
@@ -148,9 +194,9 @@ impl VehicleCommandClient {
         if let Some(err) = signer::routable_message_error(&response) {
             let fault = message_fault_code(&response);
             if is_retriable_fault(fault) {
-                if let Some(signer) = self.signer_mut(vin, Domain::Infotainment) {
+                if let Some(signer) = self.signer_mut(vin, domain) {
                     if try_sync_session_from_message(signer, &response) {
-                        self.persist_signer(vin, Domain::Infotainment)?;
+                        self.persist_signer(vin, domain)?;
                         return Err(err);
                     }
                 }
@@ -160,7 +206,7 @@ impl VehicleCommandClient {
 
         {
             let signer = self
-                .signer_mut(vin, Domain::Infotainment)
+                .signer_mut(vin, domain)
                 .ok_or_else(|| VehicleCommandError::Protocol("session not ready".into()))?;
             signer.decrypt(&mut response, &req_id)?;
         }
@@ -182,8 +228,11 @@ impl VehicleCommandClient {
             }
         };
 
-        self.parse_car_server_response(&response_payload)?;
-        self.persist_signer(vin, Domain::Infotainment)?;
+        match response_kind {
+            ResponseKind::CarServer => self.parse_car_server_response(&response_payload)?,
+            ResponseKind::Vcsec => self.parse_vcsec_response(&response_payload)?,
+        }
+        self.persist_signer(vin, domain)?;
         Ok(())
     }
 
@@ -227,7 +276,7 @@ impl VehicleCommandClient {
             .action_status
             .ok_or_else(|| VehicleCommandError::Protocol("missing action status".into()))?;
 
-        if status.result == OperationStatusE::OperationstatusError as i32 {
+        if status.result == CarServerOperationStatusE::OperationstatusError as i32 {
             let reason = status
                 .result_reason
                 .and_then(|r| r.reason)
@@ -244,6 +293,35 @@ impl VehicleCommandClient {
         }
 
         Ok(())
+    }
+
+    fn parse_vcsec_response(&self, payload: &[u8]) -> Result<()> {
+        let response = FromVcsecMessage::decode(payload)?;
+
+        if let Some(VcsecSubMessage::NominalError(err)) = response.sub_message {
+            let code = crate::vehicle_command::proto::errors::GenericErrorE::try_from(err.generic_error)
+                .map(|value| value.as_str_name().to_string())
+                .unwrap_or_else(|_| format!("error code {}", err.generic_error));
+            return Err(VehicleCommandError::VehicleFault(format!(
+                "vehicle security controller error: {code}"
+            )));
+        }
+
+        let Some(VcsecSubMessage::CommandStatus(status)) = response.sub_message else {
+            return Ok(());
+        };
+
+        match status.operation_status {
+            value if value == VcsecOperationStatusE::OperationstatusOk as i32 => Ok(()),
+            value if value == VcsecOperationStatusE::OperationstatusWait as i32 => {
+                Err(VehicleCommandError::VehicleFault(
+                    "vehicle security controller is busy".into(),
+                ))
+            }
+            _ => Err(VehicleCommandError::VehicleFault(
+                "vehicle security controller rejected command".into(),
+            )),
+        }
     }
 
     fn clear_signer(&mut self, vin: &str, domain: Domain) {

@@ -269,6 +269,8 @@ fn draw_footer(frame: &mut Frame, area: Rect) {
         Span::raw(" refresh   "),
         Span::styled("c", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" climate   "),
+        Span::styled("u", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" lock   "),
         Span::styled("l", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(" logout   "),
         Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),

@@ -298,10 +298,25 @@ pub fn request_id(message: &RoutableMessage) -> Option<Vec<u8>> {
         _ => return None,
     };
 
+    let truncate_hmac_tag = message
+        .to_destination
+        .as_ref()
+        .and_then(|dest| match &dest.sub_destination {
+            Some(SubDestination::Domain(domain)) => {
+                Some(*domain == Domain::VehicleSecurity as i32)
+            }
+            _ => None,
+        })
+        .unwrap_or(false);
+
     match &signature_data.sig_type {
         Some(SigType::HmacPersonalizedData(data)) => {
             let mut id = vec![SignatureType::HmacPersonalized as u8];
-            id.extend_from_slice(&data.tag);
+            if truncate_hmac_tag {
+                id.extend_from_slice(&data.tag[..data.tag.len().min(16)]);
+            } else {
+                id.extend_from_slice(&data.tag);
+            }
             Some(id)
         }
         Some(SigType::AesGcmPersonalizedData(data)) => {
@@ -437,6 +452,61 @@ fn epoch_bytes(info: &SessionInfo) -> [u8; EPOCH_ID_LENGTH] {
     let copy = info.epoch.len().min(EPOCH_ID_LENGTH);
     epoch[..copy].copy_from_slice(&info.epoch[..copy]);
     epoch
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vehicle_command::proto::signatures::HmacPersonalizedSignatureData;
+
+    #[test]
+    fn request_id_truncates_hmac_tag_for_vehicle_security() {
+        let tag = (0_u8..19).collect::<Vec<_>>();
+        let message = RoutableMessage {
+            to_destination: Some(Destination {
+                sub_destination: Some(SubDestination::Domain(Domain::VehicleSecurity as i32)),
+            }),
+            sub_sig_data: Some(SubSigData::SignatureData(SignatureData {
+                sig_type: Some(SigType::HmacPersonalizedData(HmacPersonalizedSignatureData {
+                    epoch: Vec::new(),
+                    counter: 1,
+                    expires_at: 0,
+                    tag: tag.clone(),
+                })),
+                signer_identity: None,
+            })),
+            ..Default::default()
+        };
+
+        let id = request_id(&message).expect("request id");
+        assert_eq!(id.len(), 17);
+        assert_eq!(id[0], SignatureType::HmacPersonalized as u8);
+        assert_eq!(&id[1..], &tag[..16]);
+    }
+
+    #[test]
+    fn request_id_keeps_full_hmac_tag_for_infotainment() {
+        let tag = (0_u8..19).collect::<Vec<_>>();
+        let message = RoutableMessage {
+            to_destination: Some(Destination {
+                sub_destination: Some(SubDestination::Domain(Domain::Infotainment as i32)),
+            }),
+            sub_sig_data: Some(SubSigData::SignatureData(SignatureData {
+                sig_type: Some(SigType::HmacPersonalizedData(HmacPersonalizedSignatureData {
+                    epoch: Vec::new(),
+                    counter: 1,
+                    expires_at: 0,
+                    tag: tag.clone(),
+                })),
+                signer_identity: None,
+            })),
+            ..Default::default()
+        };
+
+        let id = request_id(&message).expect("request id");
+        assert_eq!(id[0], SignatureType::HmacPersonalized as u8);
+        assert_eq!(&id[1..], tag.as_slice());
+    }
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
