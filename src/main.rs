@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use lazytesla::api::VehicleRefreshResult;
-use lazytesla::app::{refresh_vehicles, send_climate_command, App, Screen};
+use lazytesla::app::{refresh_vehicles, send_climate_command, send_lock_command, App, Screen};
 use lazytesla::auth::oauth::{OAuthClient, TokenSet};
 use lazytesla::auth::server::CallbackServer;
 use lazytesla::config::Config;
@@ -35,6 +35,8 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<
         mpsc::unbounded_channel::<Result<VehicleRefreshResult>>();
     let (climate_tx, mut climate_rx) =
         mpsc::unbounded_channel::<lazytesla::app::ClimateCommandOutcome>();
+    let (lock_tx, mut lock_rx) =
+        mpsc::unbounded_channel::<lazytesla::app::LockCommandOutcome>();
 
     if app.is_authenticated() {
         request_vehicle_refresh(&mut app, refresh_tx.clone());
@@ -62,6 +64,10 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<
 
         if let Ok(outcome) = climate_rx.try_recv() {
             app.apply_climate_command(&outcome.vin, outcome.result);
+        }
+
+        if let Ok(outcome) = lock_rx.try_recv() {
+            app.apply_lock_command(&outcome.vin, outcome.result);
         }
 
         if event::poll(Duration::from_millis(100))? {
@@ -94,6 +100,9 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<
                     KeyCode::Char('c') if app.screen == Screen::Home => {
                         request_climate_toggle(&mut app, climate_tx.clone());
                     }
+                    KeyCode::Char('u') if app.screen == Screen::Home => {
+                        request_lock_toggle(&mut app, lock_tx.clone());
+                    }
                     _ => {}
                 }
             }
@@ -116,6 +125,22 @@ fn request_climate_toggle(
     tokio::spawn(async move {
         let outcome = send_climate_command(request).await;
         let _ = climate_tx.send(outcome);
+    });
+}
+
+fn request_lock_toggle(
+    app: &mut App,
+    lock_tx: mpsc::UnboundedSender<lazytesla::app::LockCommandOutcome>,
+) {
+    let Some(request) = app.lock_toggle_request() else {
+        return;
+    };
+
+    app.begin_lock_command(request.action);
+
+    tokio::spawn(async move {
+        let outcome = send_lock_command(request).await;
+        let _ = lock_tx.send(outcome);
     });
 }
 

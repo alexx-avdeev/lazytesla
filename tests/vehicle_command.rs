@@ -1,5 +1,5 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
-use lazytesla::vehicle_command::climate;
+use lazytesla::vehicle_command::{climate, security};
 use lazytesla::vehicle_command::crypto::key::PrivateKey;
 use lazytesla::vehicle_command::fleet::USER_AGENT;
 use wiremock::matchers::{header, method, path};
@@ -13,6 +13,13 @@ fn climate_action_round_trips_protobuf() {
     let on = climate::build_climate_action(true).expect("marshal on");
     let off = climate::build_climate_action(false).expect("marshal off");
     assert_ne!(on, off);
+}
+
+#[test]
+fn lock_action_round_trips_protobuf() {
+    let lock = security::build_rke_action(true).expect("marshal lock");
+    let unlock = security::build_rke_action(false).expect("marshal unlock");
+    assert_ne!(lock, unlock);
 }
 
 #[tokio::test]

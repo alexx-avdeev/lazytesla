@@ -8,6 +8,7 @@ A terminal UI for managing your Tesla via the [Tesla Fleet API](https://develope
 - Two-panel vehicle view: list on the left, cached details on the right
 - Vehicle details fetched on startup and on manual refresh
 - Climate on/off toggle (native Vehicle Command Protocol or optional HTTP proxy)
+- Lock/unlock toggle (native VCP via VCSEC or optional HTTP proxy)
 - Masked VIN display
 - Optional Fleet API debug logging to a local file
 
@@ -48,7 +49,7 @@ A terminal UI for managing your Tesla via the [Tesla Fleet API](https://develope
 | `TESLA_REDIRECT_URI` | no | `http://localhost:8484/callback` | OAuth redirect URI |
 | `TESLA_AUDIENCE` | no | `https://fleet-api.prd.na.vn.cloud.tesla.com` | Fleet API region base URL |
 | `TESLA_CALLBACK_PORT` | no | `8484` | Local port for OAuth callback server |
-| `TESLA_FLEET_KEY` | no** | — | Path to fleet private key PEM (`tesla-keygen create`); preferred for climate/commands |
+| `TESLA_FLEET_KEY` | no** | — | Path to fleet private key PEM (`tesla-keygen create`); preferred for climate/lock/commands |
 | `TESLA_KEY_FILE` | no | — | Alias for `TESLA_FLEET_KEY` |
 | `TESLA_COMMAND_PROXY_URL` | no*** | — | Vehicle Command Proxy URL (fallback; use `https://127.0.0.1:4443`, not `localhost`) |
 | `TESLA_COMMAND_PROXY_CA_CERT` | no*** | — | Path to the proxy TLS certificate (`tls-cert.pem`) |
@@ -57,7 +58,7 @@ A terminal UI for managing your Tesla via the [Tesla Fleet API](https://develope
 
 \*Required for vehicle list/data in most regions. Without it you'll see a registration error on refresh.
 
-\**Required for climate toggle (`c`) on modern vehicles unless you use the proxy below. Pre-2021 Model S/X may work without signed commands for some actions.
+\**Required for climate (`c`) and lock (`u`) on modern vehicles unless you use the proxy below. Pre-2021 Model S/X may work without signed commands for some actions.
 
 \***Proxy fallback when `TESLA_FLEET_KEY` is not set. If both are set, native VCP takes priority.
 
@@ -94,14 +95,15 @@ Tokens are stored at:
 | `↓` / `j` | Next vehicle |
 | `r` | Refresh vehicle list and details |
 | `c` | Toggle climate on/off (selected vehicle) |
+| `u` | Toggle lock/unlock (selected vehicle) |
 | `l` | Log out |
 | `q` | Quit |
 
 Vehicle details are cached in memory. Switching vehicles shows cached data immediately; press `r` to fetch fresh data from the API.
 
-## Vehicle commands (climate)
+## Vehicle commands (climate and lock)
 
-Modern Teslas require commands to be signed via Tesla's [Vehicle Command Protocol](https://github.com/teslamotors/vehicle-command). LazyTesla signs commands natively in Rust when `TESLA_FLEET_KEY` is set, posting directly to Fleet API `signed_command`. Session state is cached at `~/Library/Application Support/lazytesla/session_cache.json` (macOS).
+Modern Teslas require commands to be signed via Tesla's [Vehicle Command Protocol](https://github.com/teslamotors/vehicle-command). LazyTesla signs commands natively in Rust when `TESLA_FLEET_KEY` is set, posting directly to Fleet API `signed_command`. Climate uses the infotainment domain; lock/unlock uses VCSEC (vehicle security). Session state is cached at `~/Library/Application Support/lazytesla/session_cache.json` (macOS).
 
 ### Native signing (recommended)
 

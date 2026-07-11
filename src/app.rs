@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use crate::api::{ClimateAction, FleetApi, Vehicle, VehicleDetails, VehicleRefreshResult};
+use crate::api::{ClimateAction, FleetApi, LockAction, Vehicle, VehicleDetails, VehicleRefreshResult};
 use crate::auth::oauth::{OAuthClient, TokenSet};
 use crate::auth::store::{StoredTokens, TokenStore};
 use crate::config::Config;
@@ -247,6 +247,46 @@ impl App {
         }
     }
 
+    pub fn lock_toggle_request(&self) -> Option<LockCommandRequest> {
+        let vehicle = self.selected_vehicle()?;
+        let access_token = self.tokens.as_ref()?.access_token.clone();
+        let locked = self
+            .selected_vehicle_details()
+            .and_then(|details| details.locked);
+        let action = LockAction::from_locked(locked);
+
+        Some(LockCommandRequest {
+            config: self.config.clone(),
+            access_token,
+            vin: vehicle.vin.clone(),
+            action,
+        })
+    }
+
+    pub fn begin_lock_command(&mut self, action: LockAction) {
+        self.status_message = match action {
+            LockAction::Lock => "Locking vehicle...".into(),
+            LockAction::Unlock => "Unlocking vehicle...".into(),
+        };
+    }
+
+    pub fn apply_lock_command(&mut self, vin: &str, result: Result<LockAction>) {
+        match result {
+            Ok(action) => {
+                if let Some(details) = self.vehicle_details_cache.get_mut(vin) {
+                    details.locked = Some(action.locked());
+                }
+                self.status_message = match action {
+                    LockAction::Lock => "Vehicle locked".into(),
+                    LockAction::Unlock => "Vehicle unlocked".into(),
+                };
+            }
+            Err(err) => {
+                self.status_message = err.to_string();
+            }
+        }
+    }
+
     pub fn select_previous_vehicle(&mut self) {
         if self.vehicles.is_empty() {
             return;
@@ -327,6 +367,34 @@ pub async fn send_climate_command(request: ClimateCommandRequest) -> ClimateComm
     };
 
     ClimateCommandOutcome { vin, result }
+}
+
+#[derive(Debug, Clone)]
+pub struct LockCommandRequest {
+    pub config: Config,
+    pub access_token: String,
+    pub vin: String,
+    pub action: LockAction,
+}
+
+#[derive(Debug)]
+pub struct LockCommandOutcome {
+    pub vin: String,
+    pub result: Result<LockAction>,
+}
+
+pub async fn send_lock_command(request: LockCommandRequest) -> LockCommandOutcome {
+    let vin = request.vin.clone();
+    let action = request.action;
+    let result = match FleetApi::from_config(&request.config) {
+        Ok(mut api) => api
+            .send_lock_command(&request.vin, action, &request.access_token)
+            .await
+            .map(|()| action),
+        Err(err) => Err(err),
+    };
+
+    LockCommandOutcome { vin, result }
 }
 
 #[cfg(test)]
@@ -507,6 +575,107 @@ mod tests {
         let request = app.climate_toggle_request().expect("request should exist");
 
         assert_eq!(request.action, ClimateAction::Stop);
+    }
+
+    #[test]
+    fn lock_toggle_request_locks_when_unlocked() {
+        let mut app = test_app();
+        let fetched_at = Utc::now();
+        app.vehicle_details_cache.insert(
+            "5YJSA11111111111".into(),
+            VehicleDetails {
+                vin: "5YJSA11111111111".into(),
+                display_name: "Car 1".into(),
+                state: "online".into(),
+                in_service: false,
+                battery_level: None,
+                charging_state: None,
+                battery_range: None,
+                charge_limit_soc: None,
+                locked: Some(false),
+                odometer: None,
+                car_version: None,
+                inside_temp: None,
+                outside_temp: None,
+                climate_on: None,
+                temperature_units: None,
+                fetched_at,
+            },
+        );
+
+        let request = app.lock_toggle_request().expect("request should exist");
+
+        assert_eq!(request.action, LockAction::Lock);
+        assert_eq!(request.vin, "5YJSA11111111111");
+    }
+
+    #[test]
+    fn lock_toggle_request_unlocks_when_locked() {
+        let mut app = test_app();
+        let fetched_at = Utc::now();
+        app.vehicle_details_cache.insert(
+            "5YJSA11111111111".into(),
+            VehicleDetails {
+                vin: "5YJSA11111111111".into(),
+                display_name: "Car 1".into(),
+                state: "online".into(),
+                in_service: false,
+                battery_level: None,
+                charging_state: None,
+                battery_range: None,
+                charge_limit_soc: None,
+                locked: Some(true),
+                odometer: None,
+                car_version: None,
+                inside_temp: None,
+                outside_temp: None,
+                climate_on: None,
+                temperature_units: None,
+                fetched_at,
+            },
+        );
+
+        let request = app.lock_toggle_request().expect("request should exist");
+
+        assert_eq!(request.action, LockAction::Unlock);
+    }
+
+    #[test]
+    fn apply_lock_command_updates_cached_state() {
+        let mut app = test_app();
+        let fetched_at = Utc::now();
+        app.vehicle_details_cache.insert(
+            "5YJSA11111111111".into(),
+            VehicleDetails {
+                vin: "5YJSA11111111111".into(),
+                display_name: "Car 1".into(),
+                state: "online".into(),
+                in_service: false,
+                battery_level: None,
+                charging_state: None,
+                battery_range: None,
+                charge_limit_soc: None,
+                locked: Some(false),
+                odometer: None,
+                car_version: None,
+                inside_temp: None,
+                outside_temp: None,
+                climate_on: None,
+                temperature_units: None,
+                fetched_at,
+            },
+        );
+
+        app.apply_lock_command("5YJSA11111111111", Ok(LockAction::Lock));
+
+        assert_eq!(
+            app.vehicle_details_cache
+                .get("5YJSA11111111111")
+                .unwrap()
+                .locked,
+            Some(true)
+        );
+        assert_eq!(app.status_message, "Vehicle locked");
     }
 
     #[test]

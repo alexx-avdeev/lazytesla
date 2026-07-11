@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::api::commands::ClimateAction;
+use crate::api::commands::{ClimateAction, LockAction};
 use crate::api::details::VehicleDetails;
 use crate::api::{needs_partner_registration, FleetClient, Vehicle};
 use crate::auth::partner::PartnerAuth;
@@ -112,6 +112,30 @@ impl FleetApi {
             return match action {
                 ClimateAction::Start => vcp.climate_on(vin, access_token).await,
                 ClimateAction::Stop => vcp.climate_off(vin, access_token).await,
+            }
+            .map_err(map_vehicle_command_error);
+        }
+
+        self.command
+            .send_command(
+                vin,
+                action.command_name(),
+                access_token,
+                self.proxy_configured,
+            )
+            .await
+    }
+
+    pub async fn send_lock_command(
+        &mut self,
+        vin: &str,
+        action: LockAction,
+        access_token: &str,
+    ) -> Result<()> {
+        if let Some(vcp) = &mut self.vcp {
+            return match action {
+                LockAction::Lock => vcp.lock(vin, access_token).await,
+                LockAction::Unlock => vcp.unlock(vin, access_token).await,
             }
             .map_err(map_vehicle_command_error);
         }
