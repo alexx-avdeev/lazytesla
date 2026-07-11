@@ -7,8 +7,10 @@ use crate::auth::oauth::{OAuthClient, TokenSet};
 use crate::auth::store::{StoredTokens, TokenStore};
 use crate::config::Config;
 use crate::error::{AppError, Result};
+use crate::store::{StoredVehicleCache, VehicleStore};
 
 const LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const SPINNER_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Screen {
@@ -43,9 +45,12 @@ pub struct App {
     pub vehicle_details_cache: HashMap<String, VehicleDetails>,
     pub details_refreshed_at: Option<DateTime<Utc>>,
     pub selected_vehicle: usize,
+    pub refresh_spinner_frame: usize,
+    pending_commands: u32,
     config: Config,
     oauth: OAuthClient,
     token_store: TokenStore,
+    vehicle_store: VehicleStore,
     pending_state: Option<String>,
 }
 
@@ -53,6 +58,7 @@ impl App {
     pub async fn new(config: Config) -> Result<Self> {
         let oauth = OAuthClient::new(config.clone());
         let token_store = TokenStore::new()?;
+        let vehicle_store = VehicleStore::new()?;
 
         let mut app = Self {
             screen: Screen::Auth,
@@ -64,9 +70,12 @@ impl App {
             vehicle_details_cache: HashMap::new(),
             details_refreshed_at: None,
             selected_vehicle: 0,
+            refresh_spinner_frame: 0,
+            pending_commands: 0,
             config,
             oauth,
             token_store,
+            vehicle_store,
             pending_state: None,
         };
 
@@ -134,8 +143,15 @@ impl App {
         self.tokens = Some(stored);
         self.screen = Screen::Home;
         self.auth_status = AuthStatus::Authenticated;
-        self.status_message = "Signed in successfully. Loading vehicles...".into();
-        self.clear_vehicle_data();
+        self.load_cached_vehicles()?;
+        self.status_message = if self.vehicles.is_empty() {
+            "Signed in successfully. Loading vehicles...".into()
+        } else {
+            format!(
+                "Signed in. Showing {} cached vehicle(s). Refreshing...",
+                self.vehicles.len()
+            )
+        };
         Ok(())
     }
 
@@ -148,8 +164,43 @@ impl App {
     }
 
     pub fn begin_vehicle_refresh(&mut self) {
+        if matches!(self.vehicles_status, VehiclesStatus::Loading) {
+            return;
+        }
         self.vehicles_status = VehiclesStatus::Loading;
+        self.refresh_spinner_frame = 0;
         self.status_message = "Refreshing vehicles and details...".into();
+    }
+
+    pub fn tick_spinner(&mut self) {
+        if self.shows_spinner() {
+            self.refresh_spinner_frame = (self.refresh_spinner_frame + 1) % SPINNER_FRAMES.len();
+        }
+    }
+
+    pub fn refresh_spinner(&self) -> &'static str {
+        SPINNER_FRAMES[self.refresh_spinner_frame % SPINNER_FRAMES.len()]
+    }
+
+    pub fn shows_spinner(&self) -> bool {
+        self.is_refreshing() || self.pending_commands > 0
+    }
+
+    pub fn is_refreshing(&self) -> bool {
+        matches!(self.vehicles_status, VehiclesStatus::Loading)
+    }
+
+    fn begin_async_command(&mut self) {
+        self.pending_commands += 1;
+        self.refresh_spinner_frame = 0;
+    }
+
+    fn end_async_command(&mut self) {
+        self.pending_commands = self.pending_commands.saturating_sub(1);
+    }
+
+    pub fn has_cached_vehicles(&self) -> bool {
+        !self.vehicles.is_empty()
     }
 
     pub fn apply_vehicle_refresh(&mut self, result: Result<VehicleRefreshResult>) {
@@ -188,15 +239,48 @@ impl App {
                         self.vehicle_details_cache.len()
                     )
                 };
+                let _ = self.save_cached_vehicles();
             }
             Err(err) => {
-                self.vehicles.clear();
-                self.vehicle_details_cache.clear();
-                self.details_refreshed_at = None;
-                self.vehicles_status = VehiclesStatus::Error(err.to_string());
-                self.status_message = err.to_string();
+                if self.vehicles.is_empty() {
+                    self.vehicles_status = VehiclesStatus::Error(err.to_string());
+                } else {
+                    self.vehicles_status = VehiclesStatus::Loaded;
+                }
+                self.status_message = format!("Refresh failed: {err}");
             }
         }
+    }
+
+    fn load_cached_vehicles(&mut self) -> Result<()> {
+        let Some(cache) = self.vehicle_store.load()? else {
+            return Ok(());
+        };
+
+        self.vehicles = cache.vehicles;
+        self.vehicle_details_cache = cache.details;
+        self.details_refreshed_at = cache.details_refreshed_at;
+        self.selected_vehicle = cache
+            .selected_vehicle
+            .min(self.vehicles.len().saturating_sub(1));
+        if !self.vehicles.is_empty() {
+            self.vehicles_status = VehiclesStatus::Loaded;
+        }
+        Ok(())
+    }
+
+    fn save_cached_vehicles(&self) -> Result<()> {
+        if self.vehicles.is_empty() {
+            return Ok(());
+        }
+
+        self.vehicle_store.save(&StoredVehicleCache {
+            vehicles: self.vehicles.clone(),
+            details: self.vehicle_details_cache.clone(),
+            selected_vehicle: self.selected_vehicle,
+            details_refreshed_at: self.details_refreshed_at,
+            saved_at: Utc::now(),
+        })
     }
 
     pub fn vehicle_load_request(&self) -> Option<VehicleLoadRequest> {
@@ -224,6 +308,7 @@ impl App {
     }
 
     pub fn begin_climate_command(&mut self, action: ClimateAction) {
+        self.begin_async_command();
         self.status_message = match action {
             ClimateAction::Start => "Turning climate on...".into(),
             ClimateAction::Stop => "Turning climate off...".into(),
@@ -231,6 +316,7 @@ impl App {
     }
 
     pub fn apply_climate_command(&mut self, vin: &str, result: Result<ClimateAction>) {
+        self.end_async_command();
         match result {
             Ok(action) => {
                 if let Some(details) = self.vehicle_details_cache.get_mut(vin) {
@@ -240,6 +326,7 @@ impl App {
                     ClimateAction::Start => "Climate turned on".into(),
                     ClimateAction::Stop => "Climate turned off".into(),
                 };
+                let _ = self.save_cached_vehicles();
             }
             Err(err) => {
                 self.status_message = err.to_string();
@@ -264,6 +351,7 @@ impl App {
     }
 
     pub fn begin_lock_command(&mut self, action: LockAction) {
+        self.begin_async_command();
         self.status_message = match action {
             LockAction::Lock => "Locking vehicle...".into(),
             LockAction::Unlock => "Unlocking vehicle...".into(),
@@ -271,6 +359,7 @@ impl App {
     }
 
     pub fn apply_lock_command(&mut self, vin: &str, result: Result<LockAction>) {
+        self.end_async_command();
         match result {
             Ok(action) => {
                 if let Some(details) = self.vehicle_details_cache.get_mut(vin) {
@@ -280,6 +369,7 @@ impl App {
                     LockAction::Lock => "Vehicle locked".into(),
                     LockAction::Unlock => "Vehicle unlocked".into(),
                 };
+                let _ = self.save_cached_vehicles();
             }
             Err(err) => {
                 self.status_message = err.to_string();
@@ -292,6 +382,7 @@ impl App {
             return;
         }
         self.selected_vehicle = self.selected_vehicle.saturating_sub(1);
+        let _ = self.save_cached_vehicles();
     }
 
     pub fn select_next_vehicle(&mut self) {
@@ -300,10 +391,12 @@ impl App {
         }
         let last = self.vehicles.len().saturating_sub(1);
         self.selected_vehicle = (self.selected_vehicle + 1).min(last);
+        let _ = self.save_cached_vehicles();
     }
 
     pub fn logout(&mut self) -> Result<()> {
         self.token_store.clear()?;
+        self.vehicle_store.clear()?;
         self.tokens = None;
         self.pending_state = None;
         self.clear_vehicle_data();
@@ -404,6 +497,7 @@ mod tests {
     use crate::auth::store::{StoredTokens, TokenStore};
     use crate::config::Config;
     use crate::error::AppError;
+    use crate::store::VehicleStore;
 
     use super::*;
 
@@ -451,9 +545,14 @@ mod tests {
             vehicle_details_cache: HashMap::new(),
             details_refreshed_at: None,
             selected_vehicle: 0,
+            refresh_spinner_frame: 0,
+            pending_commands: 0,
             config: test_config(),
             oauth: OAuthClient::new(test_config()),
             token_store: TokenStore::with_path(std::env::temp_dir().join("lazytesla-app-test.json")),
+            vehicle_store: VehicleStore::with_path(
+                std::env::temp_dir().join(format!("lazytesla-vehicles-app-test-{}", std::process::id())),
+            ),
             pending_state: None,
         }
     }
@@ -506,12 +605,59 @@ mod tests {
         let mut app = test_app();
         app.apply_vehicle_refresh(Err(AppError::Api("registration required".into())));
 
+        assert_eq!(app.vehicles.len(), 2);
+        assert_eq!(app.vehicles_status, VehiclesStatus::Loaded);
+        assert!(app.status_message.contains("Refresh failed"));
+    }
+
+    #[test]
+    fn apply_vehicle_refresh_error_without_cache_sets_error_state() {
+        let mut app = test_app();
+        app.vehicles.clear();
+        app.apply_vehicle_refresh(Err(AppError::Api("registration required".into())));
+
         assert!(app.vehicles.is_empty());
-        assert!(app.vehicle_details_cache.is_empty());
         assert_eq!(
             app.vehicles_status,
             VehiclesStatus::Error("API error: registration required".into())
         );
+    }
+
+    #[test]
+    fn begin_vehicle_refresh_keeps_loaded_vehicles_visible() {
+        let mut app = test_app();
+        app.begin_vehicle_refresh();
+
+        assert_eq!(app.vehicles.len(), 2);
+        assert_eq!(app.vehicles_status, VehiclesStatus::Loading);
+        assert!(app.shows_spinner());
+    }
+
+    #[test]
+    fn begin_climate_command_shows_spinner() {
+        let mut app = test_app();
+        app.begin_climate_command(ClimateAction::Start);
+
+        assert!(app.shows_spinner());
+        assert_eq!(app.status_message, "Turning climate on...");
+    }
+
+    #[test]
+    fn apply_climate_command_hides_spinner() {
+        let mut app = test_app();
+        app.begin_climate_command(ClimateAction::Start);
+        app.apply_climate_command("5YJSA11111111111", Ok(ClimateAction::Start));
+
+        assert!(!app.shows_spinner());
+    }
+
+    #[test]
+    fn begin_lock_command_shows_spinner() {
+        let mut app = test_app();
+        app.begin_lock_command(LockAction::Lock);
+
+        assert!(app.shows_spinner());
+        assert_eq!(app.status_message, "Locking vehicle...");
     }
 
     #[test]

@@ -25,10 +25,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
-    let count = match &app.vehicles_status {
-        VehiclesStatus::Loaded => format!("{} vehicle(s)", app.vehicles.len()),
-        VehiclesStatus::Loading => "refreshing...".into(),
-        _ => "vehicles".into(),
+    let count = if app.vehicles.is_empty() {
+        match &app.vehicles_status {
+            VehiclesStatus::Loading => "refreshing...".into(),
+            _ => "vehicles".into(),
+        }
+    } else {
+        format!("{} vehicle(s)", app.vehicles.len())
     };
 
     let title = Paragraph::new(Line::from(vec![
@@ -45,15 +48,30 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(title, area);
 }
 
+fn vehicle_panel_split(width: u16) -> (u16, u16) {
+    if width < 100 {
+        (25, 75)
+    } else {
+        (15, 85)
+    }
+}
+
 fn draw_main(frame: &mut Frame, area: Rect, app: &App) {
+    if app.has_cached_vehicles() {
+        let (list_pct, details_pct) = vehicle_panel_split(area.width);
+        let chunks = Layout::horizontal([
+            Constraint::Percentage(list_pct),
+            Constraint::Percentage(details_pct),
+        ])
+        .split(area);
+        draw_vehicle_list(frame, chunks[0], app);
+        draw_vehicle_details(frame, chunks[1], app);
+        return;
+    }
+
     match &app.vehicles_status {
-        VehiclesStatus::Idle => {
+        VehiclesStatus::Idle | VehiclesStatus::Loading => {
             let paragraph = Paragraph::new("Loading vehicles and details...")
-                .block(Block::default().borders(Borders::ALL).title("Vehicles"));
-            frame.render_widget(paragraph, area);
-        }
-        VehiclesStatus::Loading => {
-            let paragraph = Paragraph::new("Refreshing vehicles and details...")
                 .block(Block::default().borders(Borders::ALL).title("Vehicles"));
             frame.render_widget(paragraph, area);
         }
@@ -72,16 +90,10 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &App) {
                 .block(Block::default().borders(Borders::ALL).title("Vehicles"));
             frame.render_widget(paragraph, area);
         }
-        VehiclesStatus::Loaded if app.vehicles.is_empty() => {
+        VehiclesStatus::Loaded => {
             let paragraph = Paragraph::new("No vehicles found on this account.")
                 .block(Block::default().borders(Borders::ALL).title("Vehicles"));
             frame.render_widget(paragraph, area);
-        }
-        VehiclesStatus::Loaded => {
-            let chunks = Layout::horizontal([Constraint::Percentage(28), Constraint::Percentage(72)])
-                .split(area);
-            draw_vehicle_list(frame, chunks[0], app);
-            draw_vehicle_details(frame, chunks[1], app);
         }
     }
 }
@@ -245,10 +257,18 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         .map(|time| time.format("%Y-%m-%d %H:%M:%S UTC").to_string())
         .unwrap_or_else(|| "not cached".into());
 
-    let mut text: Vec<Line<'_>> = wrap_message(&app.status_message, 72)
-        .into_iter()
-        .map(Line::from)
-        .collect();
+    let mut text: Vec<Line<'_>> = Vec::new();
+    if app.shows_spinner() {
+        text.push(Line::from(vec![
+            Span::styled(app.refresh_spinner(), Style::default().fg(Color::Cyan)),
+            Span::raw(" "),
+            Span::raw(app.status_message.as_str()),
+        ]));
+    } else {
+        for line in wrap_message(&app.status_message, 72) {
+            text.push(Line::from(line));
+        }
+    }
     text.push(Line::from(format!("Details cached: {cache_age}")));
     text.push(Line::from(format!("Token expires: {expires}")));
 

@@ -43,6 +43,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<
     }
 
     loop {
+        app.tick_spinner();
         terminal.draw(|frame| tui::draw(frame, &app))?;
 
         if let Ok(result) = auth_rx.try_recv() {
