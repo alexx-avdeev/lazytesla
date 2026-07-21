@@ -1,7 +1,10 @@
 use std::time::Duration;
 
 use lazytesla::api::VehicleRefreshResult;
-use lazytesla::app::{refresh_vehicles, send_climate_command, send_lock_command, App, Screen};
+use lazytesla::app::{
+    refresh_vehicles, send_climate_command, send_lock_command, send_set_climate_temp_command, App,
+    Screen,
+};
 use lazytesla::auth::oauth::{OAuthClient, TokenSet};
 use lazytesla::auth::server::CallbackServer;
 use lazytesla::config::Config;
@@ -12,6 +15,9 @@ use tokio::sync::mpsc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load project .env when present; existing shell variables take precedence.
+    let _ = dotenvy::dotenv();
+
     let config = match Config::from_env() {
         Ok(config) => config,
         Err(err) => {
@@ -37,6 +43,8 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<
         mpsc::unbounded_channel::<lazytesla::app::ClimateCommandOutcome>();
     let (lock_tx, mut lock_rx) =
         mpsc::unbounded_channel::<lazytesla::app::LockCommandOutcome>();
+    let (temp_tx, mut temp_rx) =
+        mpsc::unbounded_channel::<lazytesla::app::SetClimateTempCommandOutcome>();
 
     if app.is_authenticated() {
         request_vehicle_refresh(&mut app, refresh_tx.clone());
@@ -71,10 +79,20 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<
             app.apply_lock_command(&outcome.vin, outcome.result);
         }
 
+        if let Ok(outcome) = temp_rx.try_recv() {
+            app.apply_set_climate_temp(&outcome.vin, outcome.result);
+        }
+
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
+                }
+
+                if app.screen == Screen::Home && app.is_editing_temp() {
+                    if handle_temp_input_key(&mut app, key.code, temp_tx.clone()) {
+                        continue;
+                    }
                 }
 
                 match key.code {
@@ -104,6 +122,9 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<
                     KeyCode::Char('u') if app.screen == Screen::Home => {
                         request_lock_toggle(&mut app, lock_tx.clone());
                     }
+                    KeyCode::Char('t') if app.screen == Screen::Home => {
+                        app.begin_temp_input();
+                    }
                     _ => {}
                 }
             }
@@ -111,6 +132,55 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<
     }
 
     Ok(())
+}
+
+fn handle_temp_input_key(
+    app: &mut App,
+    code: KeyCode,
+    temp_tx: mpsc::UnboundedSender<lazytesla::app::SetClimateTempCommandOutcome>,
+) -> bool {
+    match code {
+        KeyCode::Enter => {
+            if let Some(request) = app.submit_temp_input() {
+                tokio::spawn(async move {
+                    let outcome = send_set_climate_temp_command(request).await;
+                    let _ = temp_tx.send(outcome);
+                });
+            }
+            true
+        }
+        KeyCode::Esc => {
+            app.cancel_temp_input();
+            true
+        }
+        KeyCode::Backspace => {
+            app.backspace_temp_input();
+            true
+        }
+        KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Up => {
+            let delta = app
+                .selected_vehicle_details()
+                .map(|details| lazytesla::api::temp_adjust_step(details.temperature_units.as_deref()))
+                .unwrap_or(0.5);
+            app.adjust_temp_input(delta);
+            true
+        }
+        KeyCode::Char('-') | KeyCode::Char('_') | KeyCode::Down => {
+            let delta = app
+                .selected_vehicle_details()
+                .map(|details| lazytesla::api::temp_adjust_step(details.temperature_units.as_deref()))
+                .unwrap_or(0.5);
+            app.adjust_temp_input(-delta);
+            true
+        }
+        KeyCode::Char(ch) if ch.is_ascii_digit() || ch == '.' => {
+            app.append_temp_input(ch);
+            true
+        }
+        // Let quit through; swallow other home shortcuts while the modal has focus.
+        KeyCode::Char('q') => false,
+        _ => true,
+    }
 }
 
 fn request_climate_toggle(

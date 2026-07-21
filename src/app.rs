@@ -2,7 +2,11 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 
-use crate::api::{ClimateAction, FleetApi, LockAction, Vehicle, VehicleDetails, VehicleRefreshResult};
+use crate::api::{
+    celsius_to_setting_display, clamp_setting_display, format_temp, parse_display_temperature,
+    round_celsius_for_api, ClimateAction, FleetApi, LockAction, Vehicle, VehicleDetails,
+    VehicleRefreshResult,
+};
 use crate::auth::oauth::{OAuthClient, TokenSet};
 use crate::auth::store::{StoredTokens, TokenStore};
 use crate::config::Config;
@@ -46,6 +50,7 @@ pub struct App {
     pub details_refreshed_at: Option<DateTime<Utc>>,
     pub selected_vehicle: usize,
     pub refresh_spinner_frame: usize,
+    pub temp_input: Option<String>,
     pending_commands: u32,
     config: Config,
     oauth: OAuthClient,
@@ -71,6 +76,7 @@ impl App {
             details_refreshed_at: None,
             selected_vehicle: 0,
             refresh_spinner_frame: 0,
+            temp_input: None,
             pending_commands: 0,
             config,
             oauth,
@@ -358,6 +364,138 @@ impl App {
         };
     }
 
+    pub fn is_editing_temp(&self) -> bool {
+        self.temp_input.is_some()
+    }
+
+    pub fn begin_temp_input(&mut self) {
+        let Some(details) = self.selected_vehicle_details().cloned() else {
+            self.status_message = "No vehicle details available. Press r to refresh.".into();
+            return;
+        };
+
+        let gui_units = details.temperature_units.as_deref();
+        let default_display = details
+            .target_temp_setting()
+            .unwrap_or_else(|| celsius_to_setting_display(22.0, gui_units));
+
+        self.temp_input = Some(format_temp(default_display));
+        // Modal shows the editor UI; keep status clear until validation fails or send starts.
+        self.status_message.clear();
+    }
+
+    pub fn cancel_temp_input(&mut self) {
+        self.temp_input = None;
+        self.status_message = "Temperature edit cancelled".into();
+    }
+
+    pub fn append_temp_input(&mut self, ch: char) {
+        let Some(buffer) = self.temp_input.as_mut() else {
+            return;
+        };
+
+        if ch.is_ascii_digit() {
+            if buffer.len() >= 5 {
+                return;
+            }
+            buffer.push(ch);
+            self.status_message.clear();
+            return;
+        }
+
+        if ch == '.' && !buffer.contains('.') && buffer.len() < 5 {
+            if buffer.is_empty() {
+                buffer.push('0');
+            }
+            buffer.push('.');
+            self.status_message.clear();
+        }
+    }
+
+    pub fn backspace_temp_input(&mut self) {
+        if let Some(buffer) = self.temp_input.as_mut() {
+            buffer.pop();
+            self.status_message.clear();
+        }
+    }
+
+    pub fn adjust_temp_input(&mut self, delta: f64) {
+        let Some(details) = self.selected_vehicle_details() else {
+            return;
+        };
+
+        let gui_units = details.temperature_units.as_deref();
+        let bounds = details.temp_bounds();
+        let current = self
+            .temp_input
+            .as_deref()
+            .and_then(|value| value.parse::<f64>().ok())
+            .or_else(|| details.target_temp_setting())
+            .unwrap_or_else(|| celsius_to_setting_display(22.0, gui_units));
+        let adjusted = clamp_setting_display(current + delta, bounds, gui_units);
+
+        self.temp_input = Some(format_temp(adjusted));
+        self.status_message.clear();
+    }
+
+    pub fn submit_temp_input(&mut self) -> Option<SetClimateTempRequest> {
+        let buffer = self.temp_input.take()?;
+        let vin = self.selected_vehicle()?.vin.clone();
+        let details = self.selected_vehicle_details()?.clone();
+        let access_token = self.tokens.as_ref()?.access_token.clone();
+        let gui_units = details.temperature_units.as_deref();
+
+        let bounds = details.temp_bounds();
+        let celsius = match parse_display_temperature(&buffer, gui_units, bounds) {
+            Ok(value) => round_celsius_for_api(value),
+            Err(err) => {
+                self.temp_input = Some(buffer);
+                self.status_message = err;
+                return None;
+            }
+        };
+
+        let display_temp = celsius_to_setting_display(celsius, gui_units);
+        let temperature_unit = details.display_temperature_unit().to_string();
+
+        self.begin_async_command();
+        self.status_message = format!(
+            "Setting climate to {}°{temperature_unit}...",
+            format_temp(display_temp),
+        );
+
+        Some(SetClimateTempRequest {
+            config: self.config.clone(),
+            access_token,
+            vin,
+            driver_celsius: celsius,
+            passenger_celsius: celsius,
+            display_temp,
+            temperature_unit,
+        })
+    }
+
+    pub fn apply_set_climate_temp(&mut self, vin: &str, result: Result<SetClimateTempOutcome>) {
+        self.end_async_command();
+        match result {
+            Ok(outcome) => {
+                if let Some(details) = self.vehicle_details_cache.get_mut(vin) {
+                    details.driver_temp_setting = Some(outcome.display_temp);
+                    details.passenger_temp_setting = Some(outcome.display_temp);
+                }
+                self.status_message = format!(
+                    "Climate target set to {}°{}",
+                    format_temp(outcome.display_temp),
+                    outcome.temperature_unit
+                );
+                let _ = self.save_cached_vehicles();
+            }
+            Err(err) => {
+                self.status_message = err.to_string();
+            }
+        }
+    }
+
     pub fn apply_lock_command(&mut self, vin: &str, result: Result<LockAction>) {
         self.end_async_command();
         match result {
@@ -476,6 +614,54 @@ pub struct LockCommandOutcome {
     pub result: Result<LockAction>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SetClimateTempRequest {
+    pub config: Config,
+    pub access_token: String,
+    pub vin: String,
+    pub driver_celsius: f64,
+    pub passenger_celsius: f64,
+    pub display_temp: f64,
+    pub temperature_unit: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SetClimateTempOutcome {
+    pub display_temp: f64,
+    pub temperature_unit: String,
+}
+
+#[derive(Debug)]
+pub struct SetClimateTempCommandOutcome {
+    pub vin: String,
+    pub result: Result<SetClimateTempOutcome>,
+}
+
+pub async fn send_set_climate_temp_command(
+    request: SetClimateTempRequest,
+) -> SetClimateTempCommandOutcome {
+    let vin = request.vin.clone();
+    let display_temp = request.display_temp;
+    let temperature_unit = request.temperature_unit.clone();
+    let result = match FleetApi::from_config(&request.config) {
+        Ok(mut api) => api
+            .send_climate_temp_command(
+                &request.vin,
+                request.driver_celsius,
+                request.passenger_celsius,
+                &request.access_token,
+            )
+            .await
+            .map(|()| SetClimateTempOutcome {
+                display_temp,
+                temperature_unit,
+            }),
+        Err(err) => Err(err),
+    };
+
+    SetClimateTempCommandOutcome { vin, result }
+}
+
 pub async fn send_lock_command(request: LockCommandRequest) -> LockCommandOutcome {
     let vin = request.vin.clone();
     let action = request.action;
@@ -546,6 +732,7 @@ mod tests {
             details_refreshed_at: None,
             selected_vehicle: 0,
             refresh_spinner_frame: 0,
+            temp_input: None,
             pending_commands: 0,
             config: test_config(),
             oauth: OAuthClient::new(test_config()),
@@ -576,6 +763,10 @@ mod tests {
             inside_temp: Some(21.0),
             outside_temp: Some(10.0),
             climate_on: Some(false),
+            driver_temp_setting: None,
+            passenger_temp_setting: None,
+            min_avail_temp_celsius: None,
+            max_avail_temp_celsius: None,
             temperature_units: Some("F".into()),
             fetched_at,
         };
@@ -681,6 +872,10 @@ mod tests {
                 inside_temp: None,
                 outside_temp: None,
                 climate_on: Some(false),
+                driver_temp_setting: None,
+                passenger_temp_setting: None,
+                min_avail_temp_celsius: None,
+                max_avail_temp_celsius: None,
                 temperature_units: None,
                 fetched_at,
             },
@@ -713,6 +908,10 @@ mod tests {
                 inside_temp: None,
                 outside_temp: None,
                 climate_on: Some(true),
+                driver_temp_setting: None,
+                passenger_temp_setting: None,
+                min_avail_temp_celsius: None,
+                max_avail_temp_celsius: None,
                 temperature_units: None,
                 fetched_at,
             },
@@ -744,6 +943,10 @@ mod tests {
                 inside_temp: None,
                 outside_temp: None,
                 climate_on: None,
+                driver_temp_setting: None,
+                passenger_temp_setting: None,
+                min_avail_temp_celsius: None,
+                max_avail_temp_celsius: None,
                 temperature_units: None,
                 fetched_at,
             },
@@ -776,6 +979,10 @@ mod tests {
                 inside_temp: None,
                 outside_temp: None,
                 climate_on: None,
+                driver_temp_setting: None,
+                passenger_temp_setting: None,
+                min_avail_temp_celsius: None,
+                max_avail_temp_celsius: None,
                 temperature_units: None,
                 fetched_at,
             },
@@ -807,6 +1014,10 @@ mod tests {
                 inside_temp: None,
                 outside_temp: None,
                 climate_on: None,
+                driver_temp_setting: None,
+                passenger_temp_setting: None,
+                min_avail_temp_celsius: None,
+                max_avail_temp_celsius: None,
                 temperature_units: None,
                 fetched_at,
             },
@@ -822,6 +1033,201 @@ mod tests {
             Some(true)
         );
         assert_eq!(app.status_message, "Vehicle locked");
+    }
+
+    #[test]
+    fn begin_temp_input_seeds_from_target_setting() {
+        let mut app = test_app();
+        let fetched_at = Utc::now();
+        app.vehicle_details_cache.insert(
+            "5YJSA11111111111".into(),
+            VehicleDetails {
+                vin: "5YJSA11111111111".into(),
+                display_name: "Car 1".into(),
+                state: "online".into(),
+                in_service: false,
+                battery_level: None,
+                charging_state: None,
+                battery_range: None,
+                charge_limit_soc: None,
+                locked: None,
+                odometer: None,
+                car_version: None,
+                inside_temp: None,
+                outside_temp: None,
+                climate_on: Some(true),
+                driver_temp_setting: Some(72.0),
+                passenger_temp_setting: Some(72.0),
+                min_avail_temp_celsius: Some(15.0),
+                max_avail_temp_celsius: Some(28.0),
+                temperature_units: Some("F".into()),
+                fetched_at,
+            },
+        );
+
+        app.begin_temp_input();
+
+        assert_eq!(app.temp_input.as_deref(), Some("72"));
+        assert!(app.is_editing_temp());
+        assert!(app.status_message.is_empty());
+    }
+
+    #[test]
+    fn submit_temp_input_converts_fahrenheit_to_celsius_for_api() {
+        let mut app = test_app();
+        let fetched_at = Utc::now();
+        app.vehicle_details_cache.insert(
+            "5YJSA11111111111".into(),
+            VehicleDetails {
+                vin: "5YJSA11111111111".into(),
+                display_name: "Car 1".into(),
+                state: "online".into(),
+                in_service: false,
+                battery_level: None,
+                charging_state: None,
+                battery_range: None,
+                charge_limit_soc: None,
+                locked: None,
+                odometer: None,
+                car_version: None,
+                inside_temp: None,
+                outside_temp: None,
+                climate_on: Some(true),
+                driver_temp_setting: Some(72.0),
+                passenger_temp_setting: None,
+                min_avail_temp_celsius: Some(15.0),
+                max_avail_temp_celsius: Some(28.0),
+                temperature_units: Some("F".into()),
+                fetched_at,
+            },
+        );
+        app.temp_input = Some("72".into());
+
+        let request = app.submit_temp_input().expect("request");
+
+        assert!((request.driver_celsius - 22.0).abs() < f64::EPSILON);
+        assert_eq!(request.display_temp, 72.0);
+        assert_eq!(request.temperature_unit, "F");
+        assert!(app.shows_spinner());
+    }
+
+    #[test]
+    fn submit_temp_input_rejects_below_vehicle_minimum() {
+        let mut app = test_app();
+        let fetched_at = Utc::now();
+        app.vehicle_details_cache.insert(
+            "5YJSA11111111111".into(),
+            VehicleDetails {
+                vin: "5YJSA11111111111".into(),
+                display_name: "Car 1".into(),
+                state: "online".into(),
+                in_service: false,
+                battery_level: None,
+                charging_state: None,
+                battery_range: None,
+                charge_limit_soc: None,
+                locked: None,
+                odometer: None,
+                car_version: None,
+                inside_temp: None,
+                outside_temp: None,
+                climate_on: Some(true),
+                driver_temp_setting: Some(72.0),
+                passenger_temp_setting: None,
+                min_avail_temp_celsius: Some(15.0),
+                max_avail_temp_celsius: Some(28.0),
+                temperature_units: Some("F".into()),
+                fetched_at,
+            },
+        );
+        app.temp_input = Some("58".into());
+
+        assert!(app.submit_temp_input().is_none());
+        assert_eq!(app.temp_input.as_deref(), Some("58"));
+        assert!(app.status_message.contains("59°F"));
+    }
+
+    #[test]
+    fn adjust_temp_input_clamps_to_vehicle_bounds() {
+        let mut app = test_app();
+        let fetched_at = Utc::now();
+        app.vehicle_details_cache.insert(
+            "5YJSA11111111111".into(),
+            VehicleDetails {
+                vin: "5YJSA11111111111".into(),
+                display_name: "Car 1".into(),
+                state: "online".into(),
+                in_service: false,
+                battery_level: None,
+                charging_state: None,
+                battery_range: None,
+                charge_limit_soc: None,
+                locked: None,
+                odometer: None,
+                car_version: None,
+                inside_temp: None,
+                outside_temp: None,
+                climate_on: Some(true),
+                driver_temp_setting: Some(82.0),
+                passenger_temp_setting: None,
+                min_avail_temp_celsius: Some(15.0),
+                max_avail_temp_celsius: Some(28.0),
+                temperature_units: Some("F".into()),
+                fetched_at,
+            },
+        );
+        app.temp_input = Some("82".into());
+
+        app.adjust_temp_input(1.0);
+
+        assert_eq!(app.temp_input.as_deref(), Some("82"));
+    }
+
+    #[test]
+    fn apply_set_climate_temp_updates_cached_target() {
+        let mut app = test_app();
+        let fetched_at = Utc::now();
+        app.vehicle_details_cache.insert(
+            "5YJSA11111111111".into(),
+            VehicleDetails {
+                vin: "5YJSA11111111111".into(),
+                display_name: "Car 1".into(),
+                state: "online".into(),
+                in_service: false,
+                battery_level: None,
+                charging_state: None,
+                battery_range: None,
+                charge_limit_soc: None,
+                locked: None,
+                odometer: None,
+                car_version: None,
+                inside_temp: None,
+                outside_temp: None,
+                climate_on: Some(true),
+                driver_temp_setting: Some(70.0),
+                passenger_temp_setting: Some(70.0),
+                min_avail_temp_celsius: Some(15.0),
+                max_avail_temp_celsius: Some(28.0),
+                temperature_units: Some("F".into()),
+                fetched_at,
+            },
+        );
+
+        app.apply_set_climate_temp(
+            "5YJSA11111111111",
+            Ok(SetClimateTempOutcome {
+                display_temp: 72.0,
+                temperature_unit: "F".into(),
+            }),
+        );
+
+        let details = app
+            .vehicle_details_cache
+            .get("5YJSA11111111111")
+            .expect("details");
+        assert_eq!(details.driver_temp_setting, Some(72.0));
+        assert_eq!(details.passenger_temp_setting, Some(72.0));
+        assert_eq!(app.status_message, "Climate target set to 72°F");
     }
 
     #[test]
@@ -845,6 +1251,10 @@ mod tests {
                 inside_temp: None,
                 outside_temp: None,
                 climate_on: Some(false),
+                driver_temp_setting: None,
+                passenger_temp_setting: None,
+                min_avail_temp_celsius: None,
+                max_avail_temp_celsius: None,
                 temperature_units: None,
                 fetched_at,
             },
@@ -912,6 +1322,10 @@ mod tests {
                 inside_temp: None,
                 outside_temp: None,
                 climate_on: None,
+                driver_temp_setting: None,
+                passenger_temp_setting: None,
+                min_avail_temp_celsius: None,
+                max_avail_temp_celsius: None,
                 temperature_units: None,
                 fetched_at,
             },

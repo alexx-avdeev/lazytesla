@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::api::temperature;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VehicleDetails {
     pub vin: String,
@@ -17,6 +19,10 @@ pub struct VehicleDetails {
     pub inside_temp: Option<f64>,
     pub outside_temp: Option<f64>,
     pub climate_on: Option<bool>,
+    pub driver_temp_setting: Option<f64>,
+    pub passenger_temp_setting: Option<f64>,
+    pub min_avail_temp_celsius: Option<f64>,
+    pub max_avail_temp_celsius: Option<f64>,
     pub temperature_units: Option<String>,
     pub fetched_at: DateTime<Utc>,
 }
@@ -77,6 +83,14 @@ pub struct ClimateStateRaw {
     pub outside_temp: Option<f64>,
     #[serde(default)]
     pub is_climate_on: Option<bool>,
+    #[serde(default)]
+    pub driver_temp_setting: Option<f64>,
+    #[serde(default)]
+    pub passenger_temp_setting: Option<f64>,
+    #[serde(default)]
+    pub min_avail_temp: Option<f64>,
+    #[serde(default)]
+    pub max_avail_temp: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,6 +140,30 @@ impl VehicleDetails {
                     .and_then(|g| g.gui_temperature_units.as_deref()),
             ),
             climate_on: raw.climate_state.as_ref().and_then(|c| c.is_climate_on),
+            driver_temp_setting: convert_temp_for_setting(
+                raw.climate_state
+                    .as_ref()
+                    .and_then(|c| c.driver_temp_setting),
+                raw.gui_settings
+                    .as_ref()
+                    .and_then(|g| g.gui_temperature_units.as_deref()),
+            ),
+            passenger_temp_setting: convert_temp_for_setting(
+                raw.climate_state
+                    .as_ref()
+                    .and_then(|c| c.passenger_temp_setting),
+                raw.gui_settings
+                    .as_ref()
+                    .and_then(|g| g.gui_temperature_units.as_deref()),
+            ),
+            min_avail_temp_celsius: raw
+                .climate_state
+                .as_ref()
+                .and_then(|c| c.min_avail_temp),
+            max_avail_temp_celsius: raw
+                .climate_state
+                .as_ref()
+                .and_then(|c| c.max_avail_temp),
             temperature_units: raw
                 .gui_settings
                 .as_ref()
@@ -135,11 +173,37 @@ impl VehicleDetails {
     }
 
     pub fn display_temperature_unit(&self) -> &'static str {
-        if uses_fahrenheit(self.temperature_units.as_deref()) {
+        if temperature::uses_fahrenheit(self.temperature_units.as_deref()) {
             "F"
         } else {
             "C"
         }
+    }
+
+    pub fn target_temp_setting(&self) -> Option<f64> {
+        self.driver_temp_setting
+            .or(self.passenger_temp_setting)
+    }
+
+    pub fn temp_bounds(&self) -> temperature::CelsiusBounds {
+        temperature::resolve_celsius_bounds(
+            self.min_avail_temp_celsius,
+            self.max_avail_temp_celsius,
+        )
+    }
+
+    pub fn min_temp_display(&self) -> f64 {
+        temperature::celsius_to_setting_display(
+            self.temp_bounds().min,
+            self.temperature_units.as_deref(),
+        )
+    }
+
+    pub fn max_temp_display(&self) -> f64 {
+        temperature::celsius_to_setting_display(
+            self.temp_bounds().max,
+            self.temperature_units.as_deref(),
+        )
     }
 }
 
@@ -154,28 +218,16 @@ fn resolve_display_name(raw: &VehicleDataRaw) -> String {
 }
 
 fn convert_temp_for_display(celsius: Option<f64>, gui_units: Option<&str>) -> Option<f64> {
-    celsius.map(|value| {
-        if uses_fahrenheit(gui_units) {
-            celsius_to_fahrenheit(value)
-        } else {
-            value
-        }
-    })
+    celsius.map(|value| temperature::celsius_to_display(value, gui_units))
 }
 
-fn uses_fahrenheit(gui_units: Option<&str>) -> bool {
-    gui_units
-        .map(str::trim)
-        .is_some_and(|units| units.eq_ignore_ascii_case("F"))
-}
-
-fn celsius_to_fahrenheit(celsius: f64) -> f64 {
-    celsius * 9.0 / 5.0 + 32.0
+fn convert_temp_for_setting(celsius: Option<f64>, gui_units: Option<&str>) -> Option<f64> {
+    celsius.map(|value| temperature::celsius_to_setting_display(value, gui_units))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{celsius_to_fahrenheit, VehicleDataRaw, VehicleDetails};
+    use super::{temperature, VehicleDataRaw, VehicleDetails};
 
     #[test]
     fn keeps_celsius_when_gui_uses_c() {
@@ -210,9 +262,66 @@ mod tests {
     }
 
     #[test]
+    fn parses_driver_and_passenger_temp_settings() {
+        let raw: VehicleDataRaw = serde_json::from_value(serde_json::json!({
+            "vin": "5YJSA11111111111",
+            "climate_state": {
+                "driver_temp_setting": 22.0,
+                "passenger_temp_setting": 23.0
+            },
+            "gui_settings": { "gui_temperature_units": "C" }
+        }))
+        .unwrap();
+
+        let details = VehicleDetails::from_raw(raw);
+
+        assert_eq!(details.driver_temp_setting, Some(22.0));
+        assert_eq!(details.passenger_temp_setting, Some(23.0));
+        assert_eq!(details.target_temp_setting(), Some(22.0));
+    }
+
+    #[test]
+    fn rounds_fahrenheit_target_settings() {
+        let raw: VehicleDataRaw = serde_json::from_value(serde_json::json!({
+            "vin": "5YJSA11111111111",
+            "climate_state": {
+                "driver_temp_setting": 22.0,
+                "passenger_temp_setting": 22.0
+            },
+            "gui_settings": { "gui_temperature_units": "F" }
+        }))
+        .unwrap();
+
+        let details = VehicleDetails::from_raw(raw);
+
+        assert_eq!(details.driver_temp_setting, Some(72.0));
+        assert_eq!(details.passenger_temp_setting, Some(72.0));
+    }
+
+    #[test]
+    fn parses_available_temperature_bounds() {
+        let raw: VehicleDataRaw = serde_json::from_value(serde_json::json!({
+            "vin": "5YJSA11111111111",
+            "climate_state": {
+                "min_avail_temp": 15.0,
+                "max_avail_temp": 28.0
+            },
+            "gui_settings": { "gui_temperature_units": "F" }
+        }))
+        .unwrap();
+
+        let details = VehicleDetails::from_raw(raw);
+
+        assert_eq!(details.min_avail_temp_celsius, Some(15.0));
+        assert_eq!(details.max_avail_temp_celsius, Some(28.0));
+        assert_eq!(details.min_temp_display(), 59.0);
+        assert_eq!(details.max_temp_display(), 82.0);
+    }
+
+    #[test]
     fn celsius_to_fahrenheit_handles_freezing_and_boiling() {
-        assert!((celsius_to_fahrenheit(0.0) - 32.0).abs() < f64::EPSILON);
-        assert!((celsius_to_fahrenheit(100.0) - 212.0).abs() < f64::EPSILON);
+        assert!((temperature::celsius_to_fahrenheit(0.0) - 32.0).abs() < f64::EPSILON);
+        assert!((temperature::celsius_to_fahrenheit(100.0) - 212.0).abs() < f64::EPSILON);
     }
 
     #[test]
