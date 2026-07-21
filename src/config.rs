@@ -139,6 +139,20 @@ impl Config {
         Ok(())
     }
 
+    pub fn uses_native_commands(&self) -> bool {
+        self.fleet_key_path.is_some()
+    }
+
+    pub fn command_transport_label(&self) -> &'static str {
+        if self.fleet_key_path.is_some() {
+            "native signing (TESLA_FLEET_KEY)"
+        } else if self.command_proxy_url.is_some() {
+            "command proxy"
+        } else {
+            "unsigned Fleet API"
+        }
+    }
+
     pub fn command_proxy_help() -> String {
         "Vehicle commands require Tesla's Vehicle Command Protocol. \
          Set TESLA_FLEET_KEY to your fleet private key PEM (from tesla-keygen create), \
@@ -161,11 +175,32 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, DEFAULT_AUDIENCE, DEFAULT_CALLBACK_PORT, DEFAULT_REDIRECT_URI};
 
     #[test]
     fn normalizes_localhost_proxy_url_to_ipv4() {
         let url = Config::normalize_command_proxy_url("https://localhost:4443");
         assert_eq!(url, "https://127.0.0.1:4443");
+    }
+
+    #[test]
+    fn native_commands_take_priority_over_proxy_settings() {
+        let config = Config {
+            client_id: "id".into(),
+            client_secret: "secret".into(),
+            redirect_uri: DEFAULT_REDIRECT_URI.to_string(),
+            audience: DEFAULT_AUDIENCE.to_string(),
+            callback_port: DEFAULT_CALLBACK_PORT,
+            domain: None,
+            command_proxy_url: Some("https://127.0.0.1:4443".into()),
+            command_proxy_ca_cert: Some("/tmp/cert.pem".into()),
+            fleet_key_path: Some("/tmp/key.pem".into()),
+        };
+
+        assert!(config.uses_native_commands());
+        assert_eq!(
+            config.command_transport_label(),
+            "native signing (TESLA_FLEET_KEY)"
+        );
     }
 }

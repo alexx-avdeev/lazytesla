@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::api::commands::{ClimateAction, LockAction};
+use serde_json::json;
 use crate::api::details::VehicleDetails;
 use crate::api::{needs_partner_registration, FleetClient, Vehicle};
 use crate::auth::partner::PartnerAuth;
@@ -39,7 +40,8 @@ impl FleetApi {
             fleet: FleetClient::new(config.audience.clone()),
             command: FleetClient::for_config(config)?,
             partner: PartnerAuth::new(config.clone()),
-            proxy_configured: config.command_proxy_url.is_some(),
+            proxy_configured: !config.uses_native_commands()
+                && config.command_proxy_url.is_some(),
             vcp,
         })
     }
@@ -122,6 +124,37 @@ impl FleetApi {
                 action.command_name(),
                 access_token,
                 self.proxy_configured,
+            )
+            .await
+    }
+
+    pub async fn send_climate_temp_command(
+        &mut self,
+        vin: &str,
+        driver_celsius: f64,
+        passenger_celsius: f64,
+        access_token: &str,
+    ) -> Result<()> {
+        let driver = driver_celsius as f32;
+        let passenger = passenger_celsius as f32;
+
+        if let Some(vcp) = &mut self.vcp {
+            return vcp
+                .set_climate_temp(vin, access_token, driver, passenger)
+                .await
+                .map_err(map_vehicle_command_error);
+        }
+
+        self.command
+            .send_command_with_body(
+                vin,
+                "set_temps",
+                access_token,
+                self.proxy_configured,
+                json!({
+                    "driver_temp": driver_celsius,
+                    "passenger_temp": passenger_celsius,
+                }),
             )
             .await
     }

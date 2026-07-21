@@ -11,6 +11,7 @@ use crate::error::{AppError, Result};
 pub struct FleetClient {
     base_url: String,
     http: Client,
+    via_proxy: bool,
 }
 
 impl FleetClient {
@@ -19,18 +20,27 @@ impl FleetClient {
     }
 
     pub fn with_http(base_url: String, http: Client) -> Self {
+        Self::with_http_and_proxy(base_url, http, false)
+    }
+
+    fn with_http_and_proxy(base_url: String, http: Client, via_proxy: bool) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             http,
+            via_proxy,
         }
     }
 
     pub fn for_config(config: &Config) -> Result<Self> {
-        if let Some(url) = &config.command_proxy_url {
-            Self::with_tls(url.clone(), config.command_proxy_ca_cert.as_deref())
-        } else {
-            Ok(Self::new(config.audience.clone()))
+        if config.uses_native_commands() {
+            return Ok(Self::new(config.audience.clone()));
         }
+
+        if let Some(url) = &config.command_proxy_url {
+            return Self::with_tls(url.clone(), config.command_proxy_ca_cert.as_deref());
+        }
+
+        Ok(Self::new(config.audience.clone()))
     }
 
     pub fn with_tls(base_url: String, ca_cert_path: Option<&str>) -> Result<Self> {
@@ -56,7 +66,7 @@ impl FleetClient {
         let http = Client::builder()
             .add_root_certificate(cert)
             .build()?;
-        Ok(Self::with_http(base_url, http))
+        Ok(Self::with_http_and_proxy(base_url, http, true))
     }
 
     pub async fn register_partner(&self, partner_token: &str, domain: &str) -> Result<()> {
@@ -135,8 +145,20 @@ impl FleetClient {
         access_token: &str,
         proxy_configured: bool,
     ) -> Result<()> {
+        self.send_command_with_body(vin, command, access_token, proxy_configured, json!({}))
+            .await
+    }
+
+    pub async fn send_command_with_body(
+        &self,
+        vin: &str,
+        command: &str,
+        access_token: &str,
+        proxy_configured: bool,
+        params: serde_json::Value,
+    ) -> Result<()> {
         let url = format!("{}/api/1/vehicles/{vin}/command/{command}", self.base_url);
-        let body = "{}";
+        let body = params.to_string();
         let auth = format!("Bearer {access_token}");
         debug_curl::log_post_json(
             &url,
@@ -144,7 +166,7 @@ impl FleetClient {
                 ("Authorization", auth.as_str()),
                 ("Content-Type", "application/json"),
             ],
-            body,
+            &body,
         );
 
         let response = self
@@ -155,7 +177,7 @@ impl FleetClient {
             .body(body)
             .send()
             .await
-            .map_err(format_proxy_http_error)?;
+            .map_err(|err| format_command_http_error(err, self.via_proxy))?;
 
         let status = response.status();
         let body = response.text().await?;
@@ -257,12 +279,12 @@ pub fn needs_partner_registration(message: &str) -> bool {
         || lower.contains("partner_accounts")
 }
 
-fn format_proxy_http_error(err: reqwest::Error) -> AppError {
+fn format_command_http_error(err: reqwest::Error, via_proxy: bool) -> AppError {
     let details = format!("{err:?}");
     let lower = details.to_ascii_lowercase();
 
     // rustls reports handshake/cert failures as Connect errors; check TLS first.
-    if lower.contains("causedasendentity") {
+    if via_proxy && lower.contains("causedasendentity") {
         return AppError::Config(
             "TLS certificate rejected: tls-cert.pem was generated as a CA certificate \
              (CA:TRUE). Regenerate it as a server certificate with SAN entries for \
@@ -271,7 +293,7 @@ fn format_proxy_http_error(err: reqwest::Error) -> AppError {
         );
     }
 
-    if lower.contains("certificate") || lower.contains("invalidcertificate") {
+    if via_proxy && (lower.contains("certificate") || lower.contains("invalidcertificate")) {
         return AppError::Config(format!(
             "TLS error connecting to command proxy: {details}. \
              Ensure TESLA_COMMAND_PROXY_CA_CERT points to your proxy tls-cert.pem and \
@@ -280,10 +302,18 @@ fn format_proxy_http_error(err: reqwest::Error) -> AppError {
     }
 
     if err.is_connect() {
-        return AppError::Api(format!(
-            "could not connect to command proxy ({err}). \
-             Is tesla-http-proxy running? Try TESLA_COMMAND_PROXY_URL=https://127.0.0.1:4443 \
-             instead of localhost."
+        if via_proxy {
+            return AppError::Api(format!(
+                "could not connect to command proxy ({err}). \
+                 Is tesla-http-proxy running? Try TESLA_COMMAND_PROXY_URL=https://127.0.0.1:4443 \
+                 instead of localhost, or set TESLA_FLEET_KEY for native signing without a proxy."
+            ));
+        }
+
+        return AppError::Config(format!(
+            "could not reach Tesla Fleet API for vehicle commands ({err}). \
+             Set TESLA_FLEET_KEY for native signing, or run tesla-http-proxy and set \
+             TESLA_COMMAND_PROXY_URL plus TESLA_COMMAND_PROXY_CA_CERT."
         ));
     }
 

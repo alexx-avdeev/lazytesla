@@ -2,9 +2,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 
-use crate::api::VehicleDetails;
+use crate::api::{format_temp, VehicleDetails};
 use crate::app::{App, VehiclesStatus};
 use crate::util::{format_local_timestamp, mask_vin};
 
@@ -21,7 +21,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_header(frame, chunks[0], app);
     draw_main(frame, chunks[1], app);
     draw_status(frame, chunks[2], app);
-    draw_footer(frame, chunks[3]);
+    draw_footer(frame, chunks[3], app);
+
+    if app.is_editing_temp() {
+        draw_temp_modal(frame, area, app);
+    }
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -201,6 +205,11 @@ fn detail_lines(details: &VehicleDetails) -> Vec<Line<'_>> {
         Line::from(Span::styled("Climate", Style::default().fg(Color::Yellow))),
         Line::from(format_option_bool("Climate on", details.climate_on)),
         Line::from(format_option_f64(
+            "Target temp",
+            details.target_temp_setting(),
+            temp_unit,
+        )),
+        Line::from(format_option_f64(
             "Inside temp",
             details.inside_temp,
             temp_unit,
@@ -258,15 +267,18 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         .unwrap_or_else(|| "not cached".into());
 
     let mut text: Vec<Line<'_>> = Vec::new();
-    if app.shows_spinner() {
-        text.push(Line::from(vec![
-            Span::styled(app.refresh_spinner(), Style::default().fg(Color::Cyan)),
-            Span::raw(" "),
-            Span::raw(app.status_message.as_str()),
-        ]));
-    } else {
-        for line in wrap_message(&app.status_message, 72) {
-            text.push(Line::from(line));
+    // While the temp modal is open, validation errors render there — keep status quiet.
+    if !app.is_editing_temp() {
+        if app.shows_spinner() {
+            text.push(Line::from(vec![
+                Span::styled(app.refresh_spinner(), Style::default().fg(Color::Cyan)),
+                Span::raw(" "),
+                Span::raw(app.status_message.as_str()),
+            ]));
+        } else if !app.status_message.is_empty() {
+            for line in wrap_message(&app.status_message, 72) {
+                text.push(Line::from(line));
+            }
         }
     }
     text.push(Line::from(format!("Details cached: {cache_age}")));
@@ -279,23 +291,141 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect) {
-    let help = Paragraph::new(Line::from(vec![
-        Span::styled("↑/k", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" up   "),
-        Span::styled("↓/j", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" down   "),
-        Span::styled("r", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" refresh   "),
-        Span::styled("c", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" climate   "),
-        Span::styled("u", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" lock   "),
-        Span::styled("l", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" logout   "),
-        Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" quit"),
-    ]))
+fn draw_temp_modal(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(buffer) = app.temp_input.as_deref() else {
+        return;
+    };
+
+    let details = app.selected_vehicle_details();
+    let unit = details
+        .map(|d| d.display_temperature_unit())
+        .unwrap_or("C");
+    let range = details
+        .map(|d| {
+            format!(
+                "{}–{}°{unit}",
+                format_temp(d.min_temp_display()),
+                format_temp(d.max_temp_display()),
+            )
+        })
+        .unwrap_or_else(|| "—".into());
+
+    // Validation errors land in status_message while the modal stays open.
+    let error = {
+        let msg = app.status_message.as_str().trim();
+        if msg.is_empty() {
+            None
+        } else if msg.contains("temperature")
+            || msg.contains("invalid")
+            || msg.starts_with("enter ")
+        {
+            Some(msg)
+        } else {
+            None
+        }
+    };
+
+    let height = if error.is_some() { 9 } else { 7 };
+    let width = 48u16.min(area.width.saturating_sub(2).max(20));
+    let modal_area = centered_rect(width, height, area);
+
+    frame.render_widget(Clear, modal_area);
+
+    let border_style = Style::default().fg(Color::Cyan);
+    let hints = Line::from(vec![
+        Span::raw("[ "),
+        Span::styled("+/-/↑/↓", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" step  "),
+        Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" send  "),
+        Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" cancel ]"),
+    ])
+    .centered();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(Span::styled(
+            " Set target temperature ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(hints);
+
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    let value_line = Line::from(Span::styled(
+        format!("{buffer}°{unit}"),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    let mut lines = vec![
+        Line::from(""),
+        value_line,
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Range: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(range),
+        ]),
+    ];
+
+    if let Some(err) = error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            err,
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    let paragraph = Paragraph::new(lines).alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(paragraph, inner);
+}
+
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    Rect::new(x, y, width, height)
+}
+
+fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let help = if app.is_editing_temp() {
+        Paragraph::new(Line::from(vec![
+            Span::styled("digits", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" type   "),
+            Span::styled("+/-/↑/↓", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" step   "),
+            Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" send   "),
+            Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" cancel"),
+        ]))
+    } else {
+        Paragraph::new(Line::from(vec![
+            Span::styled("↑/k", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" up   "),
+            Span::styled("↓/j", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" down   "),
+            Span::styled("r", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" refresh   "),
+            Span::styled("c", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" climate   "),
+            Span::styled("t", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" set temp   "),
+            Span::styled("u", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" lock   "),
+            Span::styled("l", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" logout   "),
+            Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" quit"),
+        ]))
+    }
     .block(Block::default().borders(Borders::ALL).title("Keys"));
 
     frame.render_widget(help, area);

@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use prost::Message;
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 
 use crate::vehicle_command::climate;
 use crate::vehicle_command::crypto::key::PrivateKey;
@@ -58,6 +59,25 @@ impl VehicleCommandClient {
 
     pub async fn climate_off(&mut self, vin: &str, access_token: &str) -> Result<()> {
         self.send_climate(vin, access_token, false).await
+    }
+
+    pub async fn set_climate_temp(
+        &mut self,
+        vin: &str,
+        access_token: &str,
+        driver_celsius: f32,
+        passenger_celsius: f32,
+    ) -> Result<()> {
+        self.fleet.wake_up(vin, access_token).await?;
+        let payload = climate::build_set_temp_action(driver_celsius, passenger_celsius)?;
+        self.send_domain_action(
+            vin,
+            access_token,
+            Domain::Infotainment,
+            payload,
+            ResponseKind::CarServer,
+        )
+        .await
     }
 
     pub async fn lock(&mut self, vin: &str, access_token: &str) -> Result<()> {
@@ -271,28 +291,7 @@ impl VehicleCommandClient {
     }
 
     fn parse_car_server_response(&self, payload: &[u8]) -> Result<()> {
-        let response = Response::decode(payload)?;
-        let status = response
-            .action_status
-            .ok_or_else(|| VehicleCommandError::Protocol("missing action status".into()))?;
-
-        if status.result == CarServerOperationStatusE::OperationstatusError as i32 {
-            let reason = status
-                .result_reason
-                .and_then(|r| r.reason)
-                .and_then(|reason| match reason {
-                    crate::vehicle_command::proto::car_server::result_reason::Reason::PlainText(
-                        text,
-                    ) => Some(text),
-                })
-                .filter(|text| !text.is_empty())
-                .unwrap_or_else(|| "unspecified error".into());
-            return Err(VehicleCommandError::VehicleFault(format!(
-                "car could not execute command: {reason}"
-            )));
-        }
-
-        Ok(())
+        parse_car_server_response_bytes(payload)
     }
 
     fn parse_vcsec_response(&self, payload: &[u8]) -> Result<()> {
@@ -334,8 +333,7 @@ impl VehicleCommandClient {
         if let Some(state) = self.vin_states.get(vin) {
             return state.routing_address;
         }
-        let mut address = [0_u8; 16];
-        rand::thread_rng().fill_bytes(&mut address);
+        let address = stable_routing_address(vin);
         self.vin_states.insert(
             vin.to_string(),
             VinState {
@@ -347,13 +345,9 @@ impl VehicleCommandClient {
     }
 
     fn store_signer(&mut self, vin: &str, domain: Domain, signer: Signer) {
-        let state = self.vin_states.entry(vin.to_string()).or_insert_with(|| {
-            let mut address = [0_u8; 16];
-            rand::thread_rng().fill_bytes(&mut address);
-            VinState {
-                routing_address: address,
-                signers: HashMap::new(),
-            }
+        let state = self.vin_states.entry(vin.to_string()).or_insert_with(|| VinState {
+            routing_address: stable_routing_address(vin),
+            signers: HashMap::new(),
         });
         state.signers.insert(domain as i32, signer);
     }
@@ -363,6 +357,43 @@ impl VehicleCommandClient {
             .get_mut(vin)
             .and_then(|state| state.signers.get_mut(&(domain as i32)))
     }
+}
+
+fn parse_car_server_response_bytes(payload: &[u8]) -> Result<()> {
+    if payload.is_empty() {
+        return Ok(());
+    }
+
+    let response = Response::decode(payload)?;
+    let Some(status) = response.action_status else {
+        // Match Tesla's Go SDK: a missing action status means success.
+        return Ok(());
+    };
+
+    if status.result == CarServerOperationStatusE::OperationstatusError as i32 {
+        let reason = status
+            .result_reason
+            .and_then(|r| r.reason)
+            .and_then(|reason| match reason {
+                crate::vehicle_command::proto::car_server::result_reason::Reason::PlainText(
+                    text,
+                ) => Some(text),
+            })
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| "unspecified error".into());
+        return Err(VehicleCommandError::VehicleFault(format!(
+            "car could not execute command: {reason}"
+        )));
+    }
+
+    Ok(())
+}
+
+fn stable_routing_address(vin: &str) -> [u8; 16] {
+    let digest = Sha256::digest(vin.as_bytes());
+    let mut address = [0_u8; 16];
+    address.copy_from_slice(&digest[..16]);
+    address
 }
 
 fn encode_message(message: &RoutableMessage) -> Result<Vec<u8>> {
@@ -375,4 +406,51 @@ fn random_bytes(len: usize) -> Vec<u8> {
     let mut bytes = vec![0_u8; len];
     rand::thread_rng().fill_bytes(&mut bytes);
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vehicle_command::proto::car_server::{ActionStatus, ResultReason};
+
+    #[test]
+    fn parse_car_server_accepts_missing_action_status() {
+        let payload = Response::default().encode_to_vec();
+        parse_car_server_response_bytes(&payload).expect("missing status is success");
+    }
+
+    #[test]
+    fn parse_car_server_accepts_empty_payload() {
+        parse_car_server_response_bytes(&[]).expect("empty payload is success");
+    }
+
+    #[test]
+    fn parse_car_server_rejects_error_status() {
+        let payload = Response {
+            action_status: Some(ActionStatus {
+                result: CarServerOperationStatusE::OperationstatusError as i32,
+                result_reason: Some(ResultReason {
+                    reason: Some(
+                        crate::vehicle_command::proto::car_server::result_reason::Reason::PlainText(
+                            "hvac rejected".into(),
+                        ),
+                    ),
+                }),
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec();
+
+        let err = parse_car_server_response_bytes(&payload).expect_err("error status");
+        assert!(err.to_string().contains("hvac rejected"));
+    }
+
+    #[test]
+    fn stable_routing_address_is_deterministic_per_vin() {
+        let a = stable_routing_address("5YJSA11111111111");
+        let b = stable_routing_address("5YJSA11111111111");
+        let c = stable_routing_address("5YJSA22222222222");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
 }
