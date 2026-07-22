@@ -13,6 +13,10 @@ pub struct VehicleDetails {
     pub charging_state: Option<String>,
     pub battery_range: Option<f64>,
     pub charge_limit_soc: Option<u8>,
+    #[serde(default)]
+    pub charge_limit_soc_min: Option<u8>,
+    #[serde(default)]
+    pub charge_limit_soc_max: Option<u8>,
     pub locked: Option<bool>,
     pub odometer: Option<f64>,
     pub car_version: Option<String>,
@@ -61,6 +65,10 @@ pub struct ChargeStateRaw {
     pub battery_range: Option<f64>,
     #[serde(default)]
     pub charge_limit_soc: Option<u8>,
+    #[serde(default)]
+    pub charge_limit_soc_min: Option<u8>,
+    #[serde(default)]
+    pub charge_limit_soc_max: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,6 +129,14 @@ impl VehicleDetails {
                 .charge_state
                 .as_ref()
                 .and_then(|c| c.charge_limit_soc),
+            charge_limit_soc_min: raw
+                .charge_state
+                .as_ref()
+                .and_then(|c| c.charge_limit_soc_min),
+            charge_limit_soc_max: raw
+                .charge_state
+                .as_ref()
+                .and_then(|c| c.charge_limit_soc_max),
             locked: raw.vehicle_state.as_ref().and_then(|v| v.locked),
             odometer: raw.vehicle_state.as_ref().and_then(|v| v.odometer),
             car_version: raw
@@ -189,6 +205,13 @@ impl VehicleDetails {
         temperature::resolve_celsius_bounds(
             self.min_avail_temp_celsius,
             self.max_avail_temp_celsius,
+        )
+    }
+
+    pub fn charge_limit_bounds(&self) -> crate::api::charge_limit::ChargeLimitBounds {
+        crate::api::charge_limit::resolve_charge_limit_bounds(
+            self.charge_limit_soc_min,
+            self.charge_limit_soc_max,
         )
     }
 

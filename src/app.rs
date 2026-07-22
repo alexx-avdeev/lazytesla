@@ -3,9 +3,19 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 
 use crate::api::{
-    celsius_to_setting_display, clamp_setting_display, format_temp, parse_display_temperature,
-    round_celsius_for_api, ClimateAction, FleetApi, LockAction, Vehicle, VehicleDetails,
-    VehicleRefreshResult,
+    celsius_to_setting_display,
+    clamp_charge_limit,
+    clamp_setting_display,
+    format_temp,
+    parse_charge_limit,
+    parse_display_temperature,
+    round_celsius_for_api,
+    ClimateAction,
+    FleetApi,
+    LockAction,
+    Vehicle,
+    VehicleDetails,
+    VehicleRefreshResult
 };
 use crate::auth::oauth::{OAuthClient, TokenSet};
 use crate::auth::store::{StoredTokens, TokenStore};
@@ -51,6 +61,7 @@ pub struct App {
     pub selected_vehicle: usize,
     pub refresh_spinner_frame: usize,
     pub temp_input: Option<String>,
+    pub charge_limit_input: Option<String>,
     pending_commands: u32,
     config: Config,
     oauth: OAuthClient,
@@ -77,6 +88,7 @@ impl App {
             selected_vehicle: 0,
             refresh_spinner_frame: 0,
             temp_input: None,
+            charge_limit_input: None,
             pending_commands: 0,
             config,
             oauth,
@@ -368,7 +380,19 @@ impl App {
         self.temp_input.is_some()
     }
 
+    pub fn is_editing_charge_limit(&self) -> bool {
+        self.charge_limit_input.is_some()
+    }
+
+    pub fn is_modal_open(&self) -> bool {
+        self.is_editing_temp() || self.is_editing_charge_limit()
+    }
+
     pub fn begin_temp_input(&mut self) {
+        if self.is_modal_open() {
+            return;
+        }
+
         let Some(details) = self.selected_vehicle_details().cloned() else {
             self.status_message = "No vehicle details available. Press r to refresh.".into();
             return;
@@ -381,6 +405,21 @@ impl App {
 
         self.temp_input = Some(format_temp(default_display));
         // Modal shows the editor UI; keep status clear until validation fails or send starts.
+        self.status_message.clear();
+    }
+
+    pub fn begin_charge_limit_input(&mut self) {
+        if self.is_modal_open() {
+            return;
+        }
+
+        let Some(details) = self.selected_vehicle_details().cloned() else {
+            self.status_message = "No vehicle details available. Press r to refresh.".into();
+            return;
+        };
+
+        let default = details.charge_limit_soc.unwrap_or(80);
+        self.charge_limit_input = Some(default.to_string());
         self.status_message.clear();
     }
 
@@ -488,6 +527,96 @@ impl App {
                     format_temp(outcome.display_temp),
                     outcome.temperature_unit
                 );
+                let _ = self.save_cached_vehicles();
+            }
+            Err(err) => {
+                self.status_message = err.to_string();
+            }
+        }
+    }
+
+    pub fn cancel_charge_limit_input(&mut self) {
+        self.charge_limit_input = None;
+        self.status_message = "Charge limit edit cancelled".into();
+    }
+
+    pub fn append_charge_limit_input(&mut self, ch: char) {
+        let Some(buffer) = self.charge_limit_input.as_mut() else {
+            return;
+        };
+
+        if !ch.is_ascii_digit() || buffer.len() >= 3 {
+            return;
+        }
+        buffer.push(ch);
+        self.status_message.clear();
+    }
+
+    pub fn backspace_charge_limit_input(&mut self) {
+        if let Some(buffer) = self.charge_limit_input.as_mut() {
+            buffer.pop();
+            self.status_message.clear();
+        }
+    }
+
+    pub fn adjust_charge_limit_input(&mut self, delta: i16) {
+        let Some(details) = self.selected_vehicle_details() else {
+            return;
+        };
+
+        let bounds = details.charge_limit_bounds();
+        let current = self
+            .charge_limit_input
+            .as_deref()
+            .and_then(|value| value.parse::<i16>().ok())
+            .or_else(|| details.charge_limit_soc.map(i16::from))
+            .unwrap_or(80);
+        let adjusted = clamp_charge_limit(current + delta, bounds);
+
+        self.charge_limit_input = Some(adjusted.to_string());
+        self.status_message.clear();
+    }
+
+    pub fn submit_charge_limit_input(&mut self) -> Option<SetChargeLimitRequest> {
+        let buffer = self.charge_limit_input.take()?;
+        let vin = self.selected_vehicle()?.vin.clone();
+        let details = self.selected_vehicle_details()?.clone();
+        let access_token = self.tokens.as_ref()?.access_token.clone();
+
+        let bounds = details.charge_limit_bounds();
+        let percent = match parse_charge_limit(&buffer, bounds) {
+            Ok(value) => value,
+            Err(err) => {
+                self.charge_limit_input = Some(buffer);
+                self.status_message = err;
+                return None;
+            }
+        };
+
+        if details.charge_limit_soc == Some(percent) {
+            self.status_message = format!("Charge limit already {percent}%");
+            return None;
+        }
+
+        self.begin_async_command();
+        self.status_message = format!("Setting charge limit to {percent}%...");
+
+        Some(SetChargeLimitRequest {
+            config: self.config.clone(),
+            access_token,
+            vin,
+            percent,
+        })
+    }
+
+    pub fn apply_set_charge_limit(&mut self, vin: &str, result: Result<SetChargeLimitOutcome>) {
+        self.end_async_command();
+        match result {
+            Ok(outcome) => {
+                if let Some(details) = self.vehicle_details_cache.get_mut(vin) {
+                    details.charge_limit_soc = Some(outcome.percent);
+                }
+                self.status_message = format!("Charge limit set to {}%", outcome.percent);
                 let _ = self.save_cached_vehicles();
             }
             Err(err) => {
@@ -662,6 +791,41 @@ pub async fn send_set_climate_temp_command(
     SetClimateTempCommandOutcome { vin, result }
 }
 
+#[derive(Debug, Clone)]
+pub struct SetChargeLimitRequest {
+    pub config: Config,
+    pub access_token: String,
+    pub vin: String,
+    pub percent: u8,
+}
+
+#[derive(Debug, Clone)]
+pub struct SetChargeLimitOutcome {
+    pub percent: u8,
+}
+
+#[derive(Debug)]
+pub struct SetChargeLimitCommandOutcome {
+    pub vin: String,
+    pub result: Result<SetChargeLimitOutcome>,
+}
+
+pub async fn send_set_charge_limit_command(
+    request: SetChargeLimitRequest,
+) -> SetChargeLimitCommandOutcome {
+    let vin = request.vin.clone();
+    let percent = request.percent;
+    let result = match FleetApi::from_config(&request.config) {
+        Ok(mut api) => api
+            .send_charge_limit_command(&request.vin, percent, &request.access_token)
+            .await
+            .map(|()| SetChargeLimitOutcome { percent }),
+        Err(err) => Err(err),
+    };
+
+    SetChargeLimitCommandOutcome { vin, result }
+}
+
 pub async fn send_lock_command(request: LockCommandRequest) -> LockCommandOutcome {
     let vin = request.vin.clone();
     let action = request.action;
@@ -733,6 +897,7 @@ mod tests {
             selected_vehicle: 0,
             refresh_spinner_frame: 0,
             temp_input: None,
+            charge_limit_input: None,
             pending_commands: 0,
             config: test_config(),
             oauth: OAuthClient::new(test_config()),
@@ -757,6 +922,8 @@ mod tests {
             charging_state: Some("Complete".into()),
             battery_range: Some(250.0),
             charge_limit_soc: Some(90),
+            charge_limit_soc_min: None,
+            charge_limit_soc_max: None,
             locked: Some(true),
             odometer: Some(12_345.0),
             car_version: Some("2024.1".into()),
@@ -866,6 +1033,8 @@ mod tests {
                 charging_state: None,
                 battery_range: None,
                 charge_limit_soc: None,
+            charge_limit_soc_min: None,
+            charge_limit_soc_max: None,
                 locked: None,
                 odometer: None,
                 car_version: None,
@@ -902,6 +1071,8 @@ mod tests {
                 charging_state: None,
                 battery_range: None,
                 charge_limit_soc: None,
+            charge_limit_soc_min: None,
+            charge_limit_soc_max: None,
                 locked: None,
                 odometer: None,
                 car_version: None,
@@ -937,6 +1108,8 @@ mod tests {
                 charging_state: None,
                 battery_range: None,
                 charge_limit_soc: None,
+            charge_limit_soc_min: None,
+            charge_limit_soc_max: None,
                 locked: Some(false),
                 odometer: None,
                 car_version: None,
@@ -973,6 +1146,8 @@ mod tests {
                 charging_state: None,
                 battery_range: None,
                 charge_limit_soc: None,
+            charge_limit_soc_min: None,
+            charge_limit_soc_max: None,
                 locked: Some(true),
                 odometer: None,
                 car_version: None,
@@ -1008,6 +1183,8 @@ mod tests {
                 charging_state: None,
                 battery_range: None,
                 charge_limit_soc: None,
+            charge_limit_soc_min: None,
+            charge_limit_soc_max: None,
                 locked: Some(false),
                 odometer: None,
                 car_version: None,
@@ -1050,6 +1227,8 @@ mod tests {
                 charging_state: None,
                 battery_range: None,
                 charge_limit_soc: None,
+            charge_limit_soc_min: None,
+            charge_limit_soc_max: None,
                 locked: None,
                 odometer: None,
                 car_version: None,
@@ -1087,6 +1266,8 @@ mod tests {
                 charging_state: None,
                 battery_range: None,
                 charge_limit_soc: None,
+            charge_limit_soc_min: None,
+            charge_limit_soc_max: None,
                 locked: None,
                 odometer: None,
                 car_version: None,
@@ -1126,6 +1307,8 @@ mod tests {
                 charging_state: None,
                 battery_range: None,
                 charge_limit_soc: None,
+            charge_limit_soc_min: None,
+            charge_limit_soc_max: None,
                 locked: None,
                 odometer: None,
                 car_version: None,
@@ -1162,6 +1345,8 @@ mod tests {
                 charging_state: None,
                 battery_range: None,
                 charge_limit_soc: None,
+            charge_limit_soc_min: None,
+            charge_limit_soc_max: None,
                 locked: None,
                 odometer: None,
                 car_version: None,
@@ -1184,6 +1369,204 @@ mod tests {
     }
 
     #[test]
+    fn begin_charge_limit_input_seeds_from_cached_limit() {
+        let mut app = test_app();
+        let fetched_at = Utc::now();
+        app.vehicle_details_cache.insert(
+            "5YJSA11111111111".into(),
+            VehicleDetails {
+                vin: "5YJSA11111111111".into(),
+                display_name: "Car 1".into(),
+                state: "online".into(),
+                in_service: false,
+                battery_level: Some(55),
+                charging_state: None,
+                battery_range: None,
+                charge_limit_soc: Some(90),
+                charge_limit_soc_min: Some(50),
+                charge_limit_soc_max: Some(100),
+                locked: None,
+                odometer: None,
+                car_version: None,
+                inside_temp: None,
+                outside_temp: None,
+                climate_on: None,
+                driver_temp_setting: None,
+                passenger_temp_setting: None,
+                min_avail_temp_celsius: None,
+                max_avail_temp_celsius: None,
+                temperature_units: Some("F".into()),
+                fetched_at,
+            },
+        );
+
+        app.begin_charge_limit_input();
+
+        assert_eq!(app.charge_limit_input.as_deref(), Some("90"));
+        assert!(app.is_editing_charge_limit());
+    }
+
+    #[test]
+    fn submit_charge_limit_rejects_below_minimum() {
+        let mut app = test_app();
+        let fetched_at = Utc::now();
+        app.vehicle_details_cache.insert(
+            "5YJSA11111111111".into(),
+            VehicleDetails {
+                vin: "5YJSA11111111111".into(),
+                display_name: "Car 1".into(),
+                state: "online".into(),
+                in_service: false,
+                battery_level: None,
+                charging_state: None,
+                battery_range: None,
+                charge_limit_soc: Some(80),
+                charge_limit_soc_min: Some(50),
+                charge_limit_soc_max: Some(100),
+                locked: None,
+                odometer: None,
+                car_version: None,
+                inside_temp: None,
+                outside_temp: None,
+                climate_on: None,
+                driver_temp_setting: None,
+                passenger_temp_setting: None,
+                min_avail_temp_celsius: None,
+                max_avail_temp_celsius: None,
+                temperature_units: Some("F".into()),
+                fetched_at,
+            },
+        );
+        app.charge_limit_input = Some("40".into());
+
+        assert!(app.submit_charge_limit_input().is_none());
+        assert_eq!(app.charge_limit_input.as_deref(), Some("40"));
+        assert!(app.status_message.contains("50%"));
+    }
+
+    #[test]
+    fn submit_charge_limit_skips_when_unchanged() {
+        let mut app = test_app();
+        let fetched_at = Utc::now();
+        app.vehicle_details_cache.insert(
+            "5YJSA11111111111".into(),
+            VehicleDetails {
+                vin: "5YJSA11111111111".into(),
+                display_name: "Car 1".into(),
+                state: "online".into(),
+                in_service: false,
+                battery_level: None,
+                charging_state: None,
+                battery_range: None,
+                charge_limit_soc: Some(90),
+                charge_limit_soc_min: Some(50),
+                charge_limit_soc_max: Some(100),
+                locked: None,
+                odometer: None,
+                car_version: None,
+                inside_temp: None,
+                outside_temp: None,
+                climate_on: None,
+                driver_temp_setting: None,
+                passenger_temp_setting: None,
+                min_avail_temp_celsius: None,
+                max_avail_temp_celsius: None,
+                temperature_units: Some("F".into()),
+                fetched_at,
+            },
+        );
+        app.charge_limit_input = Some("90".into());
+
+        assert!(app.submit_charge_limit_input().is_none());
+        assert!(app.charge_limit_input.is_none());
+        assert!(!app.is_editing_charge_limit());
+        assert_eq!(app.status_message, "Charge limit already 90%");
+        assert!(!app.shows_spinner());
+    }
+
+    #[test]
+    fn adjust_charge_limit_clamps_to_bounds() {
+        let mut app = test_app();
+        let fetched_at = Utc::now();
+        app.vehicle_details_cache.insert(
+            "5YJSA11111111111".into(),
+            VehicleDetails {
+                vin: "5YJSA11111111111".into(),
+                display_name: "Car 1".into(),
+                state: "online".into(),
+                in_service: false,
+                battery_level: None,
+                charging_state: None,
+                battery_range: None,
+                charge_limit_soc: Some(100),
+                charge_limit_soc_min: Some(50),
+                charge_limit_soc_max: Some(100),
+                locked: None,
+                odometer: None,
+                car_version: None,
+                inside_temp: None,
+                outside_temp: None,
+                climate_on: None,
+                driver_temp_setting: None,
+                passenger_temp_setting: None,
+                min_avail_temp_celsius: None,
+                max_avail_temp_celsius: None,
+                temperature_units: Some("F".into()),
+                fetched_at,
+            },
+        );
+        app.charge_limit_input = Some("100".into());
+
+        app.adjust_charge_limit_input(1);
+
+        assert_eq!(app.charge_limit_input.as_deref(), Some("100"));
+    }
+
+    #[test]
+    fn apply_set_charge_limit_updates_cached_limit() {
+        let mut app = test_app();
+        let fetched_at = Utc::now();
+        app.vehicle_details_cache.insert(
+            "5YJSA11111111111".into(),
+            VehicleDetails {
+                vin: "5YJSA11111111111".into(),
+                display_name: "Car 1".into(),
+                state: "online".into(),
+                in_service: false,
+                battery_level: None,
+                charging_state: None,
+                battery_range: None,
+                charge_limit_soc: Some(80),
+                charge_limit_soc_min: Some(50),
+                charge_limit_soc_max: Some(100),
+                locked: None,
+                odometer: None,
+                car_version: None,
+                inside_temp: None,
+                outside_temp: None,
+                climate_on: None,
+                driver_temp_setting: None,
+                passenger_temp_setting: None,
+                min_avail_temp_celsius: None,
+                max_avail_temp_celsius: None,
+                temperature_units: Some("F".into()),
+                fetched_at,
+            },
+        );
+
+        app.apply_set_charge_limit(
+            "5YJSA11111111111",
+            Ok(SetChargeLimitOutcome { percent: 70 }),
+        );
+
+        assert_eq!(
+            app.vehicle_details_cache["5YJSA11111111111"].charge_limit_soc,
+            Some(70)
+        );
+        assert_eq!(app.status_message, "Charge limit set to 70%");
+    }
+
+    #[test]
     fn apply_set_climate_temp_updates_cached_target() {
         let mut app = test_app();
         let fetched_at = Utc::now();
@@ -1198,6 +1581,8 @@ mod tests {
                 charging_state: None,
                 battery_range: None,
                 charge_limit_soc: None,
+                charge_limit_soc_min: None,
+                charge_limit_soc_max: None,
                 locked: None,
                 odometer: None,
                 car_version: None,
@@ -1245,6 +1630,8 @@ mod tests {
                 charging_state: None,
                 battery_range: None,
                 charge_limit_soc: None,
+            charge_limit_soc_min: None,
+            charge_limit_soc_max: None,
                 locked: None,
                 odometer: None,
                 car_version: None,
@@ -1316,6 +1703,8 @@ mod tests {
                 charging_state: None,
                 battery_range: None,
                 charge_limit_soc: None,
+            charge_limit_soc_min: None,
+            charge_limit_soc_max: None,
                 locked: None,
                 odometer: None,
                 car_version: None,

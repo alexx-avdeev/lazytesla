@@ -2,8 +2,13 @@ use std::time::Duration;
 
 use lazytesla::api::VehicleRefreshResult;
 use lazytesla::app::{
-    refresh_vehicles, send_climate_command, send_lock_command, send_set_climate_temp_command, App,
-    Screen,
+    refresh_vehicles,
+    send_climate_command,
+    send_lock_command,
+    send_set_charge_limit_command,
+    send_set_climate_temp_command,
+    App,
+    Screen
 };
 use lazytesla::auth::oauth::{OAuthClient, TokenSet};
 use lazytesla::auth::server::CallbackServer;
@@ -45,6 +50,8 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<
         mpsc::unbounded_channel::<lazytesla::app::LockCommandOutcome>();
     let (temp_tx, mut temp_rx) =
         mpsc::unbounded_channel::<lazytesla::app::SetClimateTempCommandOutcome>();
+    let (charge_limit_tx, mut charge_limit_rx) =
+        mpsc::unbounded_channel::<lazytesla::app::SetChargeLimitCommandOutcome>();
 
     if app.is_authenticated() {
         request_vehicle_refresh(&mut app, refresh_tx.clone());
@@ -83,6 +90,10 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<
             app.apply_set_climate_temp(&outcome.vin, outcome.result);
         }
 
+        if let Ok(outcome) = charge_limit_rx.try_recv() {
+            app.apply_set_charge_limit(&outcome.vin, outcome.result);
+        }
+
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
@@ -91,6 +102,12 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<
 
                 if app.screen == Screen::Home && app.is_editing_temp() {
                     if handle_temp_input_key(&mut app, key.code, temp_tx.clone()) {
+                        continue;
+                    }
+                }
+
+                if app.screen == Screen::Home && app.is_editing_charge_limit() {
+                    if handle_charge_limit_input_key(&mut app, key.code, charge_limit_tx.clone()) {
                         continue;
                     }
                 }
@@ -124,6 +141,9 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<
                     }
                     KeyCode::Char('t') if app.screen == Screen::Home => {
                         app.begin_temp_input();
+                    }
+                    KeyCode::Char('b') if app.screen == Screen::Home => {
+                        app.begin_charge_limit_input();
                     }
                     _ => {}
                 }
@@ -178,6 +198,46 @@ fn handle_temp_input_key(
             true
         }
         // Let quit through; swallow other home shortcuts while the modal has focus.
+        KeyCode::Char('q') => false,
+        _ => true,
+    }
+}
+
+fn handle_charge_limit_input_key(
+    app: &mut App,
+    code: KeyCode,
+    charge_limit_tx: mpsc::UnboundedSender<lazytesla::app::SetChargeLimitCommandOutcome>,
+) -> bool {
+    match code {
+        KeyCode::Enter => {
+            if let Some(request) = app.submit_charge_limit_input() {
+                tokio::spawn(async move {
+                    let outcome = send_set_charge_limit_command(request).await;
+                    let _ = charge_limit_tx.send(outcome);
+                });
+            }
+            true
+        }
+        KeyCode::Esc => {
+            app.cancel_charge_limit_input();
+            true
+        }
+        KeyCode::Backspace => {
+            app.backspace_charge_limit_input();
+            true
+        }
+        KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Up => {
+            app.adjust_charge_limit_input(i16::from(lazytesla::api::CHARGE_LIMIT_STEP));
+            true
+        }
+        KeyCode::Char('-') | KeyCode::Char('_') | KeyCode::Down => {
+            app.adjust_charge_limit_input(-i16::from(lazytesla::api::CHARGE_LIMIT_STEP));
+            true
+        }
+        KeyCode::Char(ch) if ch.is_ascii_digit() => {
+            app.append_charge_limit_input(ch);
+            true
+        }
         KeyCode::Char('q') => false,
         _ => true,
     }

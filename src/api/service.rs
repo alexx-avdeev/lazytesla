@@ -159,6 +159,30 @@ impl FleetApi {
             .await
     }
 
+    pub async fn send_charge_limit_command(
+        &mut self,
+        vin: &str,
+        percent: u8,
+        access_token: &str,
+    ) -> Result<()> {
+        if let Some(vcp) = &mut self.vcp {
+            return vcp
+                .set_charge_limit(vin, access_token, percent)
+                .await
+                .map_err(map_vehicle_command_error);
+        }
+
+        self.command
+            .send_command_with_body(
+                vin,
+                "set_charge_limit",
+                access_token,
+                self.proxy_configured,
+                json!({ "percent": percent }),
+            )
+            .await
+    }
+
     pub async fn send_lock_command(
         &mut self,
         vin: &str,
