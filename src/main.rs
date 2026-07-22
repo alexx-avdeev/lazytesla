@@ -7,8 +7,9 @@ use lazytesla::app::{
     send_lock_command,
     send_set_charge_limit_command,
     send_set_climate_temp_command,
+    send_window_command,
     App,
-    Screen
+    Screen,
 };
 use lazytesla::auth::oauth::{OAuthClient, TokenSet};
 use lazytesla::auth::server::CallbackServer;
@@ -52,6 +53,8 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<
         mpsc::unbounded_channel::<lazytesla::app::SetClimateTempCommandOutcome>();
     let (charge_limit_tx, mut charge_limit_rx) =
         mpsc::unbounded_channel::<lazytesla::app::SetChargeLimitCommandOutcome>();
+    let (window_tx, mut window_rx) =
+        mpsc::unbounded_channel::<lazytesla::app::WindowCommandOutcome>();
 
     if app.is_authenticated() {
         request_vehicle_refresh(&mut app, refresh_tx.clone());
@@ -92,6 +95,10 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<
 
         if let Ok(outcome) = charge_limit_rx.try_recv() {
             app.apply_set_charge_limit(&outcome.vin, outcome.result);
+        }
+
+        if let Ok(outcome) = window_rx.try_recv() {
+            app.apply_window_command(&outcome.vin, outcome.result);
         }
 
         if event::poll(Duration::from_millis(100))? {
@@ -138,6 +145,9 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<
                     }
                     KeyCode::Char('u') if app.screen == Screen::Home => {
                         request_lock_toggle(&mut app, lock_tx.clone());
+                    }
+                    KeyCode::Char('w') if app.screen == Screen::Home => {
+                        request_window_toggle(&mut app, window_tx.clone());
                     }
                     KeyCode::Char('t') if app.screen == Screen::Home => {
                         app.begin_temp_input();
@@ -272,6 +282,22 @@ fn request_lock_toggle(
     tokio::spawn(async move {
         let outcome = send_lock_command(request).await;
         let _ = lock_tx.send(outcome);
+    });
+}
+
+fn request_window_toggle(
+    app: &mut App,
+    window_tx: mpsc::UnboundedSender<lazytesla::app::WindowCommandOutcome>,
+) {
+    let Some(request) = app.window_toggle_request() else {
+        return;
+    };
+
+    app.begin_window_command(request.action);
+
+    tokio::spawn(async move {
+        let outcome = send_window_command(request).await;
+        let _ = window_tx.send(outcome);
     });
 }
 

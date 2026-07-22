@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use crate::vehicle_command::charging;
 use crate::vehicle_command::climate;
 use crate::vehicle_command::crypto::key::PrivateKey;
+use crate::vehicle_command::windows;
 use crate::vehicle_command::crypto::signer::{
     self, build_outbound_message, build_session_info_request, is_retriable_fault, message_fault_code,
     request_id, Signer, DEFAULT_EXPIRATION, FLAG_ENCRYPT_RESPONSE,
@@ -89,6 +90,32 @@ impl VehicleCommandClient {
     ) -> Result<()> {
         self.fleet.wake_up(vin, access_token).await?;
         let payload = charging::build_set_charge_limit_action(i32::from(percent))?;
+        self.send_domain_action(
+            vin,
+            access_token,
+            Domain::Infotainment,
+            payload,
+            ResponseKind::CarServer,
+        )
+        .await
+    }
+
+    pub async fn vent_windows(&mut self, vin: &str, access_token: &str) -> Result<()> {
+        self.send_window_action(vin, access_token, true).await
+    }
+
+    pub async fn close_windows(&mut self, vin: &str, access_token: &str) -> Result<()> {
+        self.send_window_action(vin, access_token, false).await
+    }
+
+    async fn send_window_action(
+        &mut self,
+        vin: &str,
+        access_token: &str,
+        vent: bool,
+    ) -> Result<()> {
+        self.fleet.wake_up(vin, access_token).await?;
+        let payload = windows::build_window_action(vent)?;
         self.send_domain_action(
             vin,
             access_token,
