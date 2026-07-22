@@ -6,6 +6,7 @@ use prost::Message;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
+use crate::vehicle_command::charging;
 use crate::vehicle_command::climate;
 use crate::vehicle_command::crypto::key::PrivateKey;
 use crate::vehicle_command::crypto::signer::{
@@ -70,6 +71,24 @@ impl VehicleCommandClient {
     ) -> Result<()> {
         self.fleet.wake_up(vin, access_token).await?;
         let payload = climate::build_set_temp_action(driver_celsius, passenger_celsius)?;
+        self.send_domain_action(
+            vin,
+            access_token,
+            Domain::Infotainment,
+            payload,
+            ResponseKind::CarServer,
+        )
+        .await
+    }
+
+    pub async fn set_charge_limit(
+        &mut self,
+        vin: &str,
+        access_token: &str,
+        percent: u8,
+    ) -> Result<()> {
+        self.fleet.wake_up(vin, access_token).await?;
+        let payload = charging::build_set_charge_limit_action(i32::from(percent))?;
         self.send_domain_action(
             vin,
             access_token,

@@ -1,3 +1,4 @@
+mod charge_limit;
 mod client;
 mod commands;
 mod debug_curl;
@@ -6,6 +7,10 @@ mod service;
 mod temperature;
 mod vehicles;
 
+pub use charge_limit::{
+    clamp_charge_limit, parse_charge_limit, resolve_charge_limit_bounds, ChargeLimitBounds,
+    CHARGE_LIMIT_STEP, MAX_CHARGE_LIMIT_PERCENT, MIN_CHARGE_LIMIT_PERCENT,
+};
 pub use client::{needs_partner_registration, FleetClient};
 pub use commands::{ClimateAction, LockAction};
 pub use details::VehicleDetails;

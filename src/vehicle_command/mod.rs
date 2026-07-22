@@ -1,3 +1,4 @@
+pub mod charging;
 pub mod climate;
 pub mod client;
 pub mod security;

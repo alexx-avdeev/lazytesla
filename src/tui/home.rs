@@ -25,6 +25,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     if app.is_editing_temp() {
         draw_temp_modal(frame, area, app);
+    } else if app.is_editing_charge_limit() {
+        draw_charge_limit_modal(frame, area, app);
     }
 }
 
@@ -267,8 +269,8 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
         .unwrap_or_else(|| "not cached".into());
 
     let mut text: Vec<Line<'_>> = Vec::new();
-    // While the temp modal is open, validation errors render there — keep status quiet.
-    if !app.is_editing_temp() {
+    // While a modal is open, validation errors render there — keep status quiet.
+    if !app.is_modal_open() {
         if app.shows_spinner() {
             text.push(Line::from(vec![
                 Span::styled(app.refresh_spinner(), Style::default().fg(Color::Cyan)),
@@ -310,20 +312,7 @@ fn draw_temp_modal(frame: &mut Frame, area: Rect, app: &App) {
         })
         .unwrap_or_else(|| "—".into());
 
-    // Validation errors land in status_message while the modal stays open.
-    let error = {
-        let msg = app.status_message.as_str().trim();
-        if msg.is_empty() {
-            None
-        } else if msg.contains("temperature")
-            || msg.contains("invalid")
-            || msg.starts_with("enter ")
-        {
-            Some(msg)
-        } else {
-            None
-        }
-    };
+    let error = modal_error_message(app.status_message.as_str(), "temperature");
 
     let height = if error.is_some() { 9 } else { 7 };
     let width = 48u16.min(area.width.saturating_sub(2).max(20));
@@ -332,16 +321,7 @@ fn draw_temp_modal(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Clear, modal_area);
 
     let border_style = Style::default().fg(Color::Cyan);
-    let hints = Line::from(vec![
-        Span::raw("[ "),
-        Span::styled("+/-/↑/↓", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" step  "),
-        Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" send  "),
-        Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" cancel ]"),
-    ])
-    .centered();
+    let hints = modal_step_hints();
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -386,6 +366,96 @@ fn draw_temp_modal(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, inner);
 }
 
+fn draw_charge_limit_modal(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(buffer) = app.charge_limit_input.as_deref() else {
+        return;
+    };
+
+    let details = app.selected_vehicle_details();
+    let range = details
+        .map(|d| {
+            let bounds = d.charge_limit_bounds();
+            format!("{}–{}%", bounds.min, bounds.max)
+        })
+        .unwrap_or_else(|| "50–100%".into());
+
+    let error = modal_error_message(app.status_message.as_str(), "charge limit");
+
+    let height = if error.is_some() { 9 } else { 7 };
+    let width = 48u16.min(area.width.saturating_sub(2).max(20));
+    let modal_area = centered_rect(width, height, area);
+
+    frame.render_widget(Clear, modal_area);
+
+    let border_style = Style::default().fg(Color::Cyan);
+    let hints = modal_step_hints();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .title(Span::styled(
+            " Set charge limit ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(hints);
+
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    let value_line = Line::from(Span::styled(
+        format!("{buffer}%"),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    let mut lines = vec![
+        Line::from(""),
+        value_line,
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Range: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(range),
+        ]),
+    ];
+
+    if let Some(err) = error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            err,
+            Style::default().fg(Color::Red),
+        )));
+    }
+
+    let paragraph = Paragraph::new(lines).alignment(ratatui::layout::Alignment::Center);
+    frame.render_widget(paragraph, inner);
+}
+
+fn modal_step_hints() -> Line<'static> {
+    Line::from(vec![
+        Span::raw("[ "),
+        Span::styled("+/-/↑/↓", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" step  "),
+        Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" send  "),
+        Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" cancel ]"),
+    ])
+    .centered()
+}
+
+fn modal_error_message<'a>(status: &'a str, keyword: &str) -> Option<&'a str> {
+    let msg = status.trim();
+    if msg.is_empty() {
+        None
+    } else if msg.contains(keyword) || msg.contains("invalid") || msg.starts_with("enter ") {
+        Some(msg)
+    } else {
+        None
+    }
+}
+
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);
@@ -395,7 +465,7 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 }
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let help = if app.is_editing_temp() {
+    let help = if app.is_modal_open() {
         Paragraph::new(Line::from(vec![
             Span::styled("digits", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" type   "),
@@ -418,6 +488,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw(" climate   "),
             Span::styled("t", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" set temp   "),
+            Span::styled("b", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" charge limit   "),
             Span::styled("u", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" lock   "),
             Span::styled("l", Style::default().add_modifier(Modifier::BOLD)),
