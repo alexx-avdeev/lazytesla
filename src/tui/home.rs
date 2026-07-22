@@ -198,6 +198,10 @@ fn detail_lines(details: &VehicleDetails) -> Vec<Line<'_>> {
         Line::from(""),
         Line::from(Span::styled("Vehicle", Style::default().fg(Color::Yellow))),
         Line::from(format_option_bool("Locked", details.locked)),
+        Line::from(format_option_str(
+            "Windows",
+            details.windows_status_label(),
+        )),
         Line::from(format_option_f64("Odometer", details.odometer, "mi")),
         Line::from(format_option_str(
             "Software version",
@@ -492,6 +496,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             Span::raw(" charge limit   "),
             Span::styled("u", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" lock   "),
+            Span::styled("w", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" windows   "),
             Span::styled("l", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" logout   "),
             Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),

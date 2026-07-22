@@ -18,6 +18,15 @@ pub struct VehicleDetails {
     #[serde(default)]
     pub charge_limit_soc_max: Option<u8>,
     pub locked: Option<bool>,
+    /// Front driver window state from vehicle_data (0 = closed, >0 = open).
+    #[serde(default)]
+    pub fd_window: Option<u8>,
+    #[serde(default)]
+    pub fp_window: Option<u8>,
+    #[serde(default)]
+    pub rd_window: Option<u8>,
+    #[serde(default)]
+    pub rp_window: Option<u8>,
     pub odometer: Option<f64>,
     pub car_version: Option<String>,
     pub inside_temp: Option<f64>,
@@ -81,6 +90,15 @@ pub struct VehicleStateRaw {
     pub odometer: Option<f64>,
     #[serde(default)]
     pub car_version: Option<String>,
+    /// Window position: 0 closed, non-zero open/vented (Fleet vehicle_data).
+    #[serde(default)]
+    pub fd_window: Option<u8>,
+    #[serde(default)]
+    pub fp_window: Option<u8>,
+    #[serde(default)]
+    pub rd_window: Option<u8>,
+    #[serde(default)]
+    pub rp_window: Option<u8>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,6 +156,10 @@ impl VehicleDetails {
                 .as_ref()
                 .and_then(|c| c.charge_limit_soc_max),
             locked: raw.vehicle_state.as_ref().and_then(|v| v.locked),
+            fd_window: raw.vehicle_state.as_ref().and_then(|v| v.fd_window),
+            fp_window: raw.vehicle_state.as_ref().and_then(|v| v.fp_window),
+            rd_window: raw.vehicle_state.as_ref().and_then(|v| v.rd_window),
+            rp_window: raw.vehicle_state.as_ref().and_then(|v| v.rp_window),
             odometer: raw.vehicle_state.as_ref().and_then(|v| v.odometer),
             car_version: raw
                 .vehicle_state
@@ -213,6 +235,33 @@ impl VehicleDetails {
             self.charge_limit_soc_min,
             self.charge_limit_soc_max,
         )
+    }
+
+    /// Whether any reported window is open. `None` if no window data is available.
+    pub fn any_window_open(&self) -> Option<bool> {
+        let states = [self.fd_window, self.fp_window, self.rd_window, self.rp_window];
+        if states.iter().all(Option::is_none) {
+            return None;
+        }
+        Some(states.iter().flatten().any(|&state| state > 0))
+    }
+
+    /// Human-readable window summary for the details panel.
+    pub fn windows_status_label(&self) -> Option<&'static str> {
+        match self.any_window_open() {
+            Some(true) => Some("open"),
+            Some(false) => Some("closed"),
+            None => None,
+        }
+    }
+
+    /// Optimistically mark all reported windows closed (0) or vented (1).
+    pub fn set_windows_open_state(&mut self, open: bool) {
+        let state = if open { 1 } else { 0 };
+        self.fd_window = Some(state);
+        self.fp_window = Some(state);
+        self.rd_window = Some(state);
+        self.rp_window = Some(state);
     }
 
     pub fn min_temp_display(&self) -> f64 {
@@ -345,6 +394,45 @@ mod tests {
     fn celsius_to_fahrenheit_handles_freezing_and_boiling() {
         assert!((temperature::celsius_to_fahrenheit(0.0) - 32.0).abs() < f64::EPSILON);
         assert!((temperature::celsius_to_fahrenheit(100.0) - 212.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn parses_window_state_and_summarizes() {
+        let raw: VehicleDataRaw = serde_json::from_value(serde_json::json!({
+            "vin": "5YJSA11111111111",
+            "vehicle_state": {
+                "fd_window": 0,
+                "fp_window": 1,
+                "rd_window": 0,
+                "rp_window": 0
+            }
+        }))
+        .unwrap();
+
+        let details = VehicleDetails::from_raw(raw);
+
+        assert_eq!(details.fd_window, Some(0));
+        assert_eq!(details.fp_window, Some(1));
+        assert_eq!(details.any_window_open(), Some(true));
+        assert_eq!(details.windows_status_label(), Some("open"));
+    }
+
+    #[test]
+    fn windows_closed_when_all_zero() {
+        let raw: VehicleDataRaw = serde_json::from_value(serde_json::json!({
+            "vin": "5YJSA11111111111",
+            "vehicle_state": {
+                "fd_window": 0,
+                "fp_window": 0,
+                "rd_window": 0,
+                "rp_window": 0
+            }
+        }))
+        .unwrap();
+
+        let details = VehicleDetails::from_raw(raw);
+        assert_eq!(details.any_window_open(), Some(false));
+        assert_eq!(details.windows_status_label(), Some("closed"));
     }
 
     #[test]

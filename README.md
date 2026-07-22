@@ -9,6 +9,7 @@ A terminal UI for managing your Tesla via the [Tesla Fleet API](https://develope
 - Vehicle details fetched on startup and on manual refresh
 - Climate on/off toggle and target temperature setting (native Vehicle Command Protocol or optional HTTP proxy)
 - Charge limit setting (% SOC)
+- Window vent/close toggle
 - Lock/unlock toggle (native VCP via VCSEC or optional HTTP proxy)
 - Masked VIN display
 - Optional Fleet API debug logging to a local file
@@ -100,6 +101,7 @@ Tokens are stored at:
 | `b` | Set charge limit (% SOC) |
 | `+` / `-` / `↑` / `↓` | Adjust value while editing temp or charge limit |
 | `u` | Toggle lock/unlock (selected vehicle) |
+| `w` | Toggle windows vent/close (selected vehicle) |
 | `l` | Log out |
 | `q` | Quit |
 

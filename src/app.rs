@@ -15,7 +15,8 @@ use crate::api::{
     LockAction,
     Vehicle,
     VehicleDetails,
-    VehicleRefreshResult
+    VehicleRefreshResult,
+    WindowAction,
 };
 use crate::auth::oauth::{OAuthClient, TokenSet};
 use crate::auth::store::{StoredTokens, TokenStore};
@@ -374,6 +375,53 @@ impl App {
             LockAction::Lock => "Locking vehicle...".into(),
             LockAction::Unlock => "Unlocking vehicle...".into(),
         };
+    }
+
+    pub fn window_toggle_request(&self) -> Option<WindowCommandRequest> {
+        if self.is_modal_open() {
+            return None;
+        }
+
+        let vehicle = self.selected_vehicle()?;
+        let access_token = self.tokens.as_ref()?.access_token.clone();
+        let windows_open = self
+            .selected_vehicle_details()
+            .and_then(|details| details.any_window_open());
+        let action = WindowAction::from_windows_open(windows_open);
+
+        Some(WindowCommandRequest {
+            config: self.config.clone(),
+            access_token,
+            vin: vehicle.vin.clone(),
+            action,
+        })
+    }
+
+    pub fn begin_window_command(&mut self, action: WindowAction) {
+        self.begin_async_command();
+        self.status_message = match action {
+            WindowAction::Vent => "Venting windows...".into(),
+            WindowAction::Close => "Closing windows...".into(),
+        };
+    }
+
+    pub fn apply_window_command(&mut self, vin: &str, result: Result<WindowAction>) {
+        self.end_async_command();
+        match result {
+            Ok(action) => {
+                if let Some(details) = self.vehicle_details_cache.get_mut(vin) {
+                    details.set_windows_open_state(action.windows_open());
+                }
+                self.status_message = match action {
+                    WindowAction::Vent => "Windows vented".into(),
+                    WindowAction::Close => "Windows closed".into(),
+                };
+                let _ = self.save_cached_vehicles();
+            }
+            Err(err) => {
+                self.status_message = err.to_string();
+            }
+        }
     }
 
     pub fn is_editing_temp(&self) -> bool {
@@ -840,6 +888,34 @@ pub async fn send_lock_command(request: LockCommandRequest) -> LockCommandOutcom
     LockCommandOutcome { vin, result }
 }
 
+#[derive(Debug, Clone)]
+pub struct WindowCommandRequest {
+    pub config: Config,
+    pub access_token: String,
+    pub vin: String,
+    pub action: WindowAction,
+}
+
+#[derive(Debug)]
+pub struct WindowCommandOutcome {
+    pub vin: String,
+    pub result: Result<WindowAction>,
+}
+
+pub async fn send_window_command(request: WindowCommandRequest) -> WindowCommandOutcome {
+    let vin = request.vin.clone();
+    let action = request.action;
+    let result = match FleetApi::from_config(&request.config) {
+        Ok(mut api) => api
+            .send_window_command(&request.vin, action, &request.access_token)
+            .await
+            .map(|()| action),
+        Err(err) => Err(err),
+    };
+
+    WindowCommandOutcome { vin, result }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::api::Vehicle;
@@ -925,6 +1001,10 @@ mod tests {
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,
             locked: Some(true),
+            fd_window: None,
+            fp_window: None,
+            rd_window: None,
+            rp_window: None,
             odometer: Some(12_345.0),
             car_version: Some("2024.1".into()),
             inside_temp: Some(21.0),
@@ -1036,6 +1116,10 @@ mod tests {
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,
                 locked: None,
+            fd_window: None,
+            fp_window: None,
+            rd_window: None,
+            rp_window: None,
                 odometer: None,
                 car_version: None,
                 inside_temp: None,
@@ -1074,6 +1158,10 @@ mod tests {
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,
                 locked: None,
+            fd_window: None,
+            fp_window: None,
+            rd_window: None,
+            rp_window: None,
                 odometer: None,
                 car_version: None,
                 inside_temp: None,
@@ -1111,6 +1199,10 @@ mod tests {
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,
                 locked: Some(false),
+            fd_window: None,
+            fp_window: None,
+            rd_window: None,
+            rp_window: None,
                 odometer: None,
                 car_version: None,
                 inside_temp: None,
@@ -1149,6 +1241,10 @@ mod tests {
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,
                 locked: Some(true),
+            fd_window: None,
+            fp_window: None,
+            rd_window: None,
+            rp_window: None,
                 odometer: None,
                 car_version: None,
                 inside_temp: None,
@@ -1186,6 +1282,10 @@ mod tests {
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,
                 locked: Some(false),
+            fd_window: None,
+            fp_window: None,
+            rd_window: None,
+            rp_window: None,
                 odometer: None,
                 car_version: None,
                 inside_temp: None,
@@ -1213,6 +1313,89 @@ mod tests {
     }
 
     #[test]
+    fn window_toggle_request_vents_when_closed() {
+        let mut app = test_app();
+        let fetched_at = Utc::now();
+        app.vehicle_details_cache.insert(
+            "5YJSA11111111111".into(),
+            VehicleDetails {
+                vin: "5YJSA11111111111".into(),
+                display_name: "Car 1".into(),
+                state: "online".into(),
+                in_service: false,
+                battery_level: None,
+                charging_state: None,
+                battery_range: None,
+                charge_limit_soc: None,
+                charge_limit_soc_min: None,
+                charge_limit_soc_max: None,
+                locked: None,
+                fd_window: Some(0),
+                fp_window: Some(0),
+                rd_window: Some(0),
+                rp_window: Some(0),
+                odometer: None,
+                car_version: None,
+                inside_temp: None,
+                outside_temp: None,
+                climate_on: None,
+                driver_temp_setting: None,
+                passenger_temp_setting: None,
+                min_avail_temp_celsius: None,
+                max_avail_temp_celsius: None,
+                temperature_units: None,
+                fetched_at,
+            },
+        );
+
+        let request = app.window_toggle_request().expect("request");
+        assert_eq!(request.action, WindowAction::Vent);
+    }
+
+    #[test]
+    fn apply_window_command_updates_cached_state() {
+        let mut app = test_app();
+        let fetched_at = Utc::now();
+        app.vehicle_details_cache.insert(
+            "5YJSA11111111111".into(),
+            VehicleDetails {
+                vin: "5YJSA11111111111".into(),
+                display_name: "Car 1".into(),
+                state: "online".into(),
+                in_service: false,
+                battery_level: None,
+                charging_state: None,
+                battery_range: None,
+                charge_limit_soc: None,
+                charge_limit_soc_min: None,
+                charge_limit_soc_max: None,
+                locked: None,
+                fd_window: Some(0),
+                fp_window: Some(0),
+                rd_window: Some(0),
+                rp_window: Some(0),
+                odometer: None,
+                car_version: None,
+                inside_temp: None,
+                outside_temp: None,
+                climate_on: None,
+                driver_temp_setting: None,
+                passenger_temp_setting: None,
+                min_avail_temp_celsius: None,
+                max_avail_temp_celsius: None,
+                temperature_units: None,
+                fetched_at,
+            },
+        );
+
+        app.apply_window_command("5YJSA11111111111", Ok(WindowAction::Vent));
+
+        let details = app.vehicle_details_cache.get("5YJSA11111111111").unwrap();
+        assert_eq!(details.any_window_open(), Some(true));
+        assert_eq!(app.status_message, "Windows vented");
+    }
+
+    #[test]
     fn begin_temp_input_seeds_from_target_setting() {
         let mut app = test_app();
         let fetched_at = Utc::now();
@@ -1230,6 +1413,10 @@ mod tests {
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,
                 locked: None,
+            fd_window: None,
+            fp_window: None,
+            rd_window: None,
+            rp_window: None,
                 odometer: None,
                 car_version: None,
                 inside_temp: None,
@@ -1269,6 +1456,10 @@ mod tests {
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,
                 locked: None,
+            fd_window: None,
+            fp_window: None,
+            rd_window: None,
+            rp_window: None,
                 odometer: None,
                 car_version: None,
                 inside_temp: None,
@@ -1310,6 +1501,10 @@ mod tests {
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,
                 locked: None,
+            fd_window: None,
+            fp_window: None,
+            rd_window: None,
+            rp_window: None,
                 odometer: None,
                 car_version: None,
                 inside_temp: None,
@@ -1348,6 +1543,10 @@ mod tests {
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,
                 locked: None,
+            fd_window: None,
+            fp_window: None,
+            rd_window: None,
+            rp_window: None,
                 odometer: None,
                 car_version: None,
                 inside_temp: None,
@@ -1386,6 +1585,10 @@ mod tests {
                 charge_limit_soc_min: Some(50),
                 charge_limit_soc_max: Some(100),
                 locked: None,
+            fd_window: None,
+            fp_window: None,
+            rd_window: None,
+            rp_window: None,
                 odometer: None,
                 car_version: None,
                 inside_temp: None,
@@ -1424,6 +1627,10 @@ mod tests {
                 charge_limit_soc_min: Some(50),
                 charge_limit_soc_max: Some(100),
                 locked: None,
+            fd_window: None,
+            fp_window: None,
+            rd_window: None,
+            rp_window: None,
                 odometer: None,
                 car_version: None,
                 inside_temp: None,
@@ -1462,6 +1669,10 @@ mod tests {
                 charge_limit_soc_min: Some(50),
                 charge_limit_soc_max: Some(100),
                 locked: None,
+            fd_window: None,
+            fp_window: None,
+            rd_window: None,
+            rp_window: None,
                 odometer: None,
                 car_version: None,
                 inside_temp: None,
@@ -1502,6 +1713,10 @@ mod tests {
                 charge_limit_soc_min: Some(50),
                 charge_limit_soc_max: Some(100),
                 locked: None,
+            fd_window: None,
+            fp_window: None,
+            rd_window: None,
+            rp_window: None,
                 odometer: None,
                 car_version: None,
                 inside_temp: None,
@@ -1540,6 +1755,10 @@ mod tests {
                 charge_limit_soc_min: Some(50),
                 charge_limit_soc_max: Some(100),
                 locked: None,
+            fd_window: None,
+            fp_window: None,
+            rd_window: None,
+            rp_window: None,
                 odometer: None,
                 car_version: None,
                 inside_temp: None,
@@ -1584,6 +1803,10 @@ mod tests {
                 charge_limit_soc_min: None,
                 charge_limit_soc_max: None,
                 locked: None,
+            fd_window: None,
+            fp_window: None,
+            rd_window: None,
+            rp_window: None,
                 odometer: None,
                 car_version: None,
                 inside_temp: None,
@@ -1633,6 +1856,10 @@ mod tests {
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,
                 locked: None,
+            fd_window: None,
+            fp_window: None,
+            rd_window: None,
+            rp_window: None,
                 odometer: None,
                 car_version: None,
                 inside_temp: None,
@@ -1706,6 +1933,10 @@ mod tests {
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,
                 locked: None,
+            fd_window: None,
+            fp_window: None,
+            rd_window: None,
+            rp_window: None,
                 odometer: None,
                 car_version: None,
                 inside_temp: None,

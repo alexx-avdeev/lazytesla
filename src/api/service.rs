@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::api::commands::{ClimateAction, LockAction};
+use crate::api::commands::{ClimateAction, LockAction, WindowAction};
 use serde_json::json;
 use crate::api::details::VehicleDetails;
 use crate::api::{needs_partner_registration, FleetClient, Vehicle};
@@ -203,6 +203,35 @@ impl FleetApi {
                 action.command_name(),
                 access_token,
                 self.proxy_configured,
+            )
+            .await
+    }
+
+    pub async fn send_window_command(
+        &mut self,
+        vin: &str,
+        action: WindowAction,
+        access_token: &str,
+    ) -> Result<()> {
+        if let Some(vcp) = &mut self.vcp {
+            return match action {
+                WindowAction::Vent => vcp.vent_windows(vin, access_token).await,
+                WindowAction::Close => vcp.close_windows(vin, access_token).await,
+            }
+            .map_err(map_vehicle_command_error);
+        }
+
+        self.command
+            .send_command_with_body(
+                vin,
+                action.command_name(),
+                access_token,
+                self.proxy_configured,
+                json!({
+                    "command": action.command_body_value(),
+                    "lat": 0.0,
+                    "lon": 0.0,
+                }),
             )
             .await
     }
