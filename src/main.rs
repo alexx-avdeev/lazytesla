@@ -2,22 +2,27 @@ use std::time::Duration;
 
 use lazytesla::api::VehicleRefreshResult;
 use lazytesla::app::{
-    refresh_vehicles,
-    send_climate_command,
-    send_lock_command,
-    send_set_charge_limit_command,
-    send_set_climate_temp_command,
-    send_window_command,
-    App,
-    Screen,
+    refresh_vehicles, send_charge_command, send_climate_command, send_lock_command,
+    send_set_charge_limit_command, send_set_climate_temp_command, send_window_command, App, Screen,
 };
 use lazytesla::auth::oauth::{OAuthClient, TokenSet};
 use lazytesla::auth::server::CallbackServer;
 use lazytesla::config::Config;
 use lazytesla::error::{AppError, Result};
+use lazytesla::help_menu::HomeCommand;
 use lazytesla::tui;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::mpsc;
+
+struct CommandChannels {
+    refresh_tx: mpsc::UnboundedSender<Result<VehicleRefreshResult>>,
+    climate_tx: mpsc::UnboundedSender<lazytesla::app::ClimateCommandOutcome>,
+    lock_tx: mpsc::UnboundedSender<lazytesla::app::LockCommandOutcome>,
+    temp_tx: mpsc::UnboundedSender<lazytesla::app::SetClimateTempCommandOutcome>,
+    charge_limit_tx: mpsc::UnboundedSender<lazytesla::app::SetChargeLimitCommandOutcome>,
+    window_tx: mpsc::UnboundedSender<lazytesla::app::WindowCommandOutcome>,
+    charge_tx: mpsc::UnboundedSender<lazytesla::app::ChargeCommandOutcome>,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -55,9 +60,21 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<
         mpsc::unbounded_channel::<lazytesla::app::SetChargeLimitCommandOutcome>();
     let (window_tx, mut window_rx) =
         mpsc::unbounded_channel::<lazytesla::app::WindowCommandOutcome>();
+    let (charge_tx, mut charge_rx) =
+        mpsc::unbounded_channel::<lazytesla::app::ChargeCommandOutcome>();
+
+    let channels = CommandChannels {
+        refresh_tx: refresh_tx.clone(),
+        climate_tx: climate_tx.clone(),
+        lock_tx: lock_tx.clone(),
+        temp_tx: temp_tx.clone(),
+        charge_limit_tx: charge_limit_tx.clone(),
+        window_tx: window_tx.clone(),
+        charge_tx: charge_tx.clone(),
+    };
 
     if app.is_authenticated() {
-        request_vehicle_refresh(&mut app, refresh_tx.clone());
+        request_vehicle_refresh(&mut app, channels.refresh_tx.clone());
     }
 
     loop {
@@ -70,7 +87,7 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<
                     if let Err(err) = app.set_authenticated(tokens).await {
                         app.set_error(err);
                     } else {
-                        request_vehicle_refresh(&mut app, refresh_tx.clone());
+                        request_vehicle_refresh(&mut app, channels.refresh_tx.clone());
                     }
                 }
                 Err(err) => app.set_error(err),
@@ -101,6 +118,10 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<
             app.apply_window_command(&outcome.vin, outcome.result);
         }
 
+        if let Ok(outcome) = charge_rx.try_recv() {
+            app.apply_charge_command(&outcome.vin, outcome.result);
+        }
+
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
@@ -108,60 +129,156 @@ async fn run(terminal: &mut ratatui::DefaultTerminal, config: Config) -> Result<
                 }
 
                 if app.screen == Screen::Home && app.is_editing_temp() {
-                    if handle_temp_input_key(&mut app, key.code, temp_tx.clone()) {
+                    if handle_temp_input_key(&mut app, key.code, channels.temp_tx.clone()) {
                         continue;
                     }
                 }
 
                 if app.screen == Screen::Home && app.is_editing_charge_limit() {
-                    if handle_charge_limit_input_key(&mut app, key.code, charge_limit_tx.clone()) {
+                    if handle_charge_limit_input_key(
+                        &mut app,
+                        key.code,
+                        channels.charge_limit_tx.clone(),
+                    ) {
                         continue;
                     }
                 }
 
-                match key.code {
-                    KeyCode::Char('q') => break,
-                    KeyCode::Enter if app.screen == Screen::Auth => {
-                        if let Err(err) = start_login(&mut app, auth_tx.clone()) {
-                            app.set_error(err);
+                if app.screen == Screen::Home && app.is_help_open() {
+                    match handle_help_key(&mut app, key.code) {
+                        HelpKeyResult::Handled => continue,
+                        HelpKeyResult::Run(command) => {
+                            if dispatch_home_command(&mut app, command, &channels) {
+                                break;
+                            }
+                            continue;
                         }
+                        HelpKeyResult::Quit => break,
                     }
-                    KeyCode::Char('l') if app.screen == Screen::Home => {
-                        if let Err(err) = app.logout() {
-                            app.set_error(err);
-                        }
-                    }
-                    KeyCode::Char('r') if app.screen == Screen::Home => {
-                        request_vehicle_refresh(&mut app, refresh_tx.clone());
-                    }
-                    KeyCode::Up | KeyCode::Char('k') if app.screen == Screen::Home => {
-                        app.select_previous_vehicle();
-                    }
-                    KeyCode::Down | KeyCode::Char('j') if app.screen == Screen::Home => {
-                        app.select_next_vehicle();
-                    }
-                    KeyCode::Char('c') if app.screen == Screen::Home => {
-                        request_climate_toggle(&mut app, climate_tx.clone());
-                    }
-                    KeyCode::Char('u') if app.screen == Screen::Home => {
-                        request_lock_toggle(&mut app, lock_tx.clone());
-                    }
-                    KeyCode::Char('w') if app.screen == Screen::Home => {
-                        request_window_toggle(&mut app, window_tx.clone());
-                    }
-                    KeyCode::Char('t') if app.screen == Screen::Home => {
-                        app.begin_temp_input();
-                    }
-                    KeyCode::Char('b') if app.screen == Screen::Home => {
-                        app.begin_charge_limit_input();
-                    }
-                    _ => {}
+                }
+
+                if dispatch_key(&mut app, key, &channels, &auth_tx) {
+                    break;
                 }
             }
         }
     }
 
     Ok(())
+}
+
+/// Returns true if the app should quit.
+fn dispatch_key(
+    app: &mut App,
+    key: KeyEvent,
+    channels: &CommandChannels,
+    auth_tx: &mpsc::UnboundedSender<Result<TokenSet>>,
+) -> bool {
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    match key.code {
+        KeyCode::Char('q') => return true,
+        KeyCode::Enter if app.screen == Screen::Auth => {
+            if let Err(err) = start_login(app, auth_tx.clone()) {
+                app.set_error(err);
+            }
+        }
+        KeyCode::Char('?') if app.screen == Screen::Home => {
+            app.open_help();
+        }
+        KeyCode::Char('c') if app.screen == Screen::Home && alt => {
+            request_charge_toggle(app, channels.charge_tx.clone());
+        }
+        KeyCode::Char('c') if app.screen == Screen::Home && !alt => {
+            request_climate_toggle(app, channels.climate_tx.clone());
+        }
+        KeyCode::Char('l') if app.screen == Screen::Home => {
+            if let Err(err) = app.logout() {
+                app.set_error(err);
+            }
+        }
+        KeyCode::Char('r') if app.screen == Screen::Home => {
+            request_vehicle_refresh(app, channels.refresh_tx.clone());
+        }
+        KeyCode::Up | KeyCode::Char('k') if app.screen == Screen::Home => {
+            app.select_previous_vehicle();
+        }
+        KeyCode::Down | KeyCode::Char('j') if app.screen == Screen::Home => {
+            app.select_next_vehicle();
+        }
+        KeyCode::Char('u') if app.screen == Screen::Home => {
+            request_lock_toggle(app, channels.lock_tx.clone());
+        }
+        KeyCode::Char('w') if app.screen == Screen::Home => {
+            request_window_toggle(app, channels.window_tx.clone());
+        }
+        KeyCode::Char('t') if app.screen == Screen::Home => {
+            app.begin_temp_input();
+        }
+        KeyCode::Char('b') if app.screen == Screen::Home => {
+            app.begin_charge_limit_input();
+        }
+        _ => {}
+    }
+
+    false
+}
+
+/// Returns true if the app should quit.
+fn dispatch_home_command(
+    app: &mut App,
+    command: HomeCommand,
+    channels: &CommandChannels,
+) -> bool {
+    match command {
+        HomeCommand::PreviousVehicle => app.select_previous_vehicle(),
+        HomeCommand::NextVehicle => app.select_next_vehicle(),
+        HomeCommand::Refresh => request_vehicle_refresh(app, channels.refresh_tx.clone()),
+        HomeCommand::ClimateToggle => {
+            request_climate_toggle(app, channels.climate_tx.clone());
+        }
+        HomeCommand::SetTemp => app.begin_temp_input(),
+        HomeCommand::SetChargeLimit => app.begin_charge_limit_input(),
+        HomeCommand::LockToggle => request_lock_toggle(app, channels.lock_tx.clone()),
+        HomeCommand::WindowToggle => request_window_toggle(app, channels.window_tx.clone()),
+        HomeCommand::ChargeToggle => request_charge_toggle(app, channels.charge_tx.clone()),
+        HomeCommand::Logout => {
+            if let Err(err) = app.logout() {
+                app.set_error(err);
+            }
+        }
+        HomeCommand::Quit => return true,
+    }
+    false
+}
+
+enum HelpKeyResult {
+    Handled,
+    Run(HomeCommand),
+    Quit,
+}
+
+fn handle_help_key(app: &mut App, code: KeyCode) -> HelpKeyResult {
+    match code {
+        KeyCode::Esc => {
+            app.close_help();
+            HelpKeyResult::Handled
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.help_move_selection(-1);
+            HelpKeyResult::Handled
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.help_move_selection(1);
+            HelpKeyResult::Handled
+        }
+        KeyCode::Enter => match app.confirm_help_selection() {
+            Some(command) => HelpKeyResult::Run(command),
+            None => HelpKeyResult::Handled,
+        },
+        KeyCode::Char('q') => HelpKeyResult::Quit,
+        _ => HelpKeyResult::Handled,
+    }
 }
 
 fn handle_temp_input_key(
@@ -207,7 +324,6 @@ fn handle_temp_input_key(
             app.append_temp_input(ch);
             true
         }
-        // Let quit through; swallow other home shortcuts while the modal has focus.
         KeyCode::Char('q') => false,
         _ => true,
     }
@@ -298,6 +414,22 @@ fn request_window_toggle(
     tokio::spawn(async move {
         let outcome = send_window_command(request).await;
         let _ = window_tx.send(outcome);
+    });
+}
+
+fn request_charge_toggle(
+    app: &mut App,
+    charge_tx: mpsc::UnboundedSender<lazytesla::app::ChargeCommandOutcome>,
+) {
+    let Some(request) = app.charge_toggle_request() else {
+        return;
+    };
+
+    app.begin_charge_command(request.action);
+
+    tokio::spawn(async move {
+        let outcome = send_charge_command(request).await;
+        let _ = charge_tx.send(outcome);
     });
 }
 

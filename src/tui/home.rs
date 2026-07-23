@@ -27,6 +27,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
         draw_temp_modal(frame, area, app);
     } else if app.is_editing_charge_limit() {
         draw_charge_limit_modal(frame, area, app);
+    } else if app.is_help_open() {
+        draw_help_modal(frame, area, app);
     }
 }
 
@@ -189,6 +191,11 @@ fn detail_lines(details: &VehicleDetails) -> Vec<Line<'_>> {
             "Range",
             details.battery_range,
             "mi",
+        )),
+        Line::from(format_option_f64(
+            "Charge rate",
+            details.charge_rate,
+            "mi/h",
         )),
         Line::from(format_option_u8(
             "Charge limit",
@@ -468,8 +475,78 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     Rect::new(x, y, width, height)
 }
 
+fn draw_help_modal(frame: &mut Frame, area: Rect, app: &App) {
+    let entries = app.help_entries();
+    let selected = app.help_selected_index().unwrap_or(0);
+
+    let height = (entries.len() as u16)
+        .saturating_add(4)
+        .min(area.height.saturating_sub(2))
+        .max(8);
+    let width = 56u16.min(area.width.saturating_sub(2).max(30));
+    let modal_area = centered_rect(width, height, area);
+
+    frame.render_widget(Clear, modal_area);
+
+    let hints = Line::from(vec![
+        Span::raw("[ "),
+        Span::styled("↑/↓", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" move  "),
+        Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" run  "),
+        Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" close ]"),
+    ])
+    .centered();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            " Hotkeys ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(hints);
+
+    let inner = block.inner(modal_area);
+    frame.render_widget(block, modal_area);
+
+    let items: Vec<ListItem> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let style = if index == selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let line = format!(" {:<10}  {}", entry.keys, entry.description);
+            ListItem::new(line).style(style)
+        })
+        .collect();
+
+    let list = List::new(items);
+    frame.render_widget(list, inner);
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let help = if app.is_modal_open() {
+    let help = if app.is_help_open() {
+        Paragraph::new(Line::from(vec![
+            Span::styled("↑/↓", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" move   "),
+            Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" run   "),
+            Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" close   "),
+            Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" quit"),
+        ]))
+    } else if app.is_editing_temp() || app.is_editing_charge_limit() {
         Paragraph::new(Line::from(vec![
             Span::styled("digits", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" type   "),
@@ -491,15 +568,15 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled("c", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" climate   "),
             Span::styled("t", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" set temp   "),
+            Span::raw(" temp   "),
             Span::styled("b", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" charge limit   "),
+            Span::raw(" limit   "),
             Span::styled("u", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" lock   "),
             Span::styled("w", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" windows   "),
-            Span::styled("l", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(" logout   "),
+            Span::styled("?", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" help   "),
             Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(" quit"),
         ]))

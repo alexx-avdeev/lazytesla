@@ -10,6 +10,7 @@ use crate::api::{
     parse_charge_limit,
     parse_display_temperature,
     round_celsius_for_api,
+    ChargeAction,
     ClimateAction,
     FleetApi,
     LockAction,
@@ -18,6 +19,7 @@ use crate::api::{
     VehicleRefreshResult,
     WindowAction,
 };
+use crate::help_menu::{HelpEntry, HomeCommand, HELP_ENTRIES};
 use crate::auth::oauth::{OAuthClient, TokenSet};
 use crate::auth::store::{StoredTokens, TokenStore};
 use crate::config::Config;
@@ -63,6 +65,8 @@ pub struct App {
     pub refresh_spinner_frame: usize,
     pub temp_input: Option<String>,
     pub charge_limit_input: Option<String>,
+    /// Selected index in the `?` help modal; `None` when closed.
+    pub help_selection: Option<usize>,
     pending_commands: u32,
     config: Config,
     oauth: OAuthClient,
@@ -90,6 +94,7 @@ impl App {
             refresh_spinner_frame: 0,
             temp_input: None,
             charge_limit_input: None,
+            help_selection: None,
             pending_commands: 0,
             config,
             oauth,
@@ -424,6 +429,53 @@ impl App {
         }
     }
 
+    pub fn charge_toggle_request(&self) -> Option<ChargeCommandRequest> {
+        if self.is_modal_open() {
+            return None;
+        }
+
+        let vehicle = self.selected_vehicle()?;
+        let access_token = self.tokens.as_ref()?.access_token.clone();
+        let charging_state = self
+            .selected_vehicle_details()
+            .and_then(|details| details.charging_state.as_deref());
+        let action = ChargeAction::from_charging_state(charging_state);
+
+        Some(ChargeCommandRequest {
+            config: self.config.clone(),
+            access_token,
+            vin: vehicle.vin.clone(),
+            action,
+        })
+    }
+
+    pub fn begin_charge_command(&mut self, action: ChargeAction) {
+        self.begin_async_command();
+        self.status_message = match action {
+            ChargeAction::Start => "Starting charge...".into(),
+            ChargeAction::Stop => "Stopping charge...".into(),
+        };
+    }
+
+    pub fn apply_charge_command(&mut self, vin: &str, result: Result<ChargeAction>) {
+        self.end_async_command();
+        match result {
+            Ok(action) => {
+                if let Some(details) = self.vehicle_details_cache.get_mut(vin) {
+                    details.charging_state = Some(action.resulting_charging_state().into());
+                }
+                self.status_message = match action {
+                    ChargeAction::Start => "Charging started".into(),
+                    ChargeAction::Stop => "Charging stopped".into(),
+                };
+                let _ = self.save_cached_vehicles();
+            }
+            Err(err) => {
+                self.status_message = err.to_string();
+            }
+        }
+    }
+
     pub fn is_editing_temp(&self) -> bool {
         self.temp_input.is_some()
     }
@@ -432,8 +484,51 @@ impl App {
         self.charge_limit_input.is_some()
     }
 
+    pub fn is_help_open(&self) -> bool {
+        self.help_selection.is_some()
+    }
+
     pub fn is_modal_open(&self) -> bool {
-        self.is_editing_temp() || self.is_editing_charge_limit()
+        self.is_editing_temp() || self.is_editing_charge_limit() || self.is_help_open()
+    }
+
+    pub fn open_help(&mut self) {
+        if self.is_modal_open() {
+            return;
+        }
+        self.help_selection = Some(0);
+        self.status_message.clear();
+    }
+
+    pub fn close_help(&mut self) {
+        self.help_selection = None;
+        self.status_message = "Help closed".into();
+    }
+
+    pub fn help_move_selection(&mut self, delta: i32) {
+        let Some(selected) = self.help_selection.as_mut() else {
+            return;
+        };
+        let len = HELP_ENTRIES.len() as i32;
+        if len == 0 {
+            return;
+        }
+        let next = (*selected as i32 + delta).rem_euclid(len);
+        *selected = next as usize;
+    }
+
+    pub fn help_entries(&self) -> &'static [HelpEntry] {
+        HELP_ENTRIES
+    }
+
+    pub fn help_selected_index(&self) -> Option<usize> {
+        self.help_selection
+    }
+
+    /// Closes help and returns the selected command to run.
+    pub fn confirm_help_selection(&mut self) -> Option<HomeCommand> {
+        let index = self.help_selection.take()?;
+        HELP_ENTRIES.get(index).map(|entry| entry.command)
     }
 
     pub fn begin_temp_input(&mut self) {
@@ -916,6 +1011,34 @@ pub async fn send_window_command(request: WindowCommandRequest) -> WindowCommand
     WindowCommandOutcome { vin, result }
 }
 
+#[derive(Debug, Clone)]
+pub struct ChargeCommandRequest {
+    pub config: Config,
+    pub access_token: String,
+    pub vin: String,
+    pub action: ChargeAction,
+}
+
+#[derive(Debug)]
+pub struct ChargeCommandOutcome {
+    pub vin: String,
+    pub result: Result<ChargeAction>,
+}
+
+pub async fn send_charge_command(request: ChargeCommandRequest) -> ChargeCommandOutcome {
+    let vin = request.vin.clone();
+    let action = request.action;
+    let result = match FleetApi::from_config(&request.config) {
+        Ok(mut api) => api
+            .send_charge_command(&request.vin, action, &request.access_token)
+            .await
+            .map(|()| action),
+        Err(err) => Err(err),
+    };
+
+    ChargeCommandOutcome { vin, result }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::api::Vehicle;
@@ -974,6 +1097,7 @@ mod tests {
             refresh_spinner_frame: 0,
             temp_input: None,
             charge_limit_input: None,
+            help_selection: None,
             pending_commands: 0,
             config: test_config(),
             oauth: OAuthClient::new(test_config()),
@@ -997,6 +1121,7 @@ mod tests {
             battery_level: Some(80),
             charging_state: Some("Complete".into()),
             battery_range: Some(250.0),
+            charge_rate: None,
             charge_limit_soc: Some(90),
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,
@@ -1112,6 +1237,7 @@ mod tests {
                 battery_level: None,
                 charging_state: None,
                 battery_range: None,
+            charge_rate: None,
                 charge_limit_soc: None,
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,
@@ -1154,6 +1280,7 @@ mod tests {
                 battery_level: None,
                 charging_state: None,
                 battery_range: None,
+            charge_rate: None,
                 charge_limit_soc: None,
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,
@@ -1195,6 +1322,7 @@ mod tests {
                 battery_level: None,
                 charging_state: None,
                 battery_range: None,
+            charge_rate: None,
                 charge_limit_soc: None,
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,
@@ -1237,6 +1365,7 @@ mod tests {
                 battery_level: None,
                 charging_state: None,
                 battery_range: None,
+            charge_rate: None,
                 charge_limit_soc: None,
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,
@@ -1278,6 +1407,7 @@ mod tests {
                 battery_level: None,
                 charging_state: None,
                 battery_range: None,
+            charge_rate: None,
                 charge_limit_soc: None,
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,
@@ -1326,6 +1456,7 @@ mod tests {
                 battery_level: None,
                 charging_state: None,
                 battery_range: None,
+            charge_rate: None,
                 charge_limit_soc: None,
                 charge_limit_soc_min: None,
                 charge_limit_soc_max: None,
@@ -1366,6 +1497,7 @@ mod tests {
                 battery_level: None,
                 charging_state: None,
                 battery_range: None,
+            charge_rate: None,
                 charge_limit_soc: None,
                 charge_limit_soc_min: None,
                 charge_limit_soc_max: None,
@@ -1396,6 +1528,58 @@ mod tests {
     }
 
     #[test]
+    fn charge_toggle_request_stops_when_charging() {
+        let mut app = test_app();
+        let fetched_at = Utc::now();
+        app.vehicle_details_cache.insert(
+            "5YJSA11111111111".into(),
+            VehicleDetails {
+                vin: "5YJSA11111111111".into(),
+                display_name: "Car 1".into(),
+                state: "online".into(),
+                in_service: false,
+                battery_level: Some(40),
+                charging_state: Some("Charging".into()),
+                battery_range: None,
+            charge_rate: None,
+                charge_limit_soc: Some(80),
+                charge_limit_soc_min: None,
+                charge_limit_soc_max: None,
+                locked: None,
+                fd_window: None,
+                fp_window: None,
+                rd_window: None,
+                rp_window: None,
+                odometer: None,
+                car_version: None,
+                inside_temp: None,
+                outside_temp: None,
+                climate_on: None,
+                driver_temp_setting: None,
+                passenger_temp_setting: None,
+                min_avail_temp_celsius: None,
+                max_avail_temp_celsius: None,
+                temperature_units: None,
+                fetched_at,
+            },
+        );
+
+        let request = app.charge_toggle_request().expect("request");
+        assert_eq!(request.action, ChargeAction::Stop);
+    }
+
+    #[test]
+    fn help_confirm_returns_selected_command() {
+        let mut app = test_app();
+        app.open_help();
+        assert!(app.is_help_open());
+        app.help_move_selection(2); // refresh
+        let command = app.confirm_help_selection().expect("command");
+        assert_eq!(command, HomeCommand::Refresh);
+        assert!(!app.is_help_open());
+    }
+
+    #[test]
     fn begin_temp_input_seeds_from_target_setting() {
         let mut app = test_app();
         let fetched_at = Utc::now();
@@ -1409,6 +1593,7 @@ mod tests {
                 battery_level: None,
                 charging_state: None,
                 battery_range: None,
+            charge_rate: None,
                 charge_limit_soc: None,
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,
@@ -1452,6 +1637,7 @@ mod tests {
                 battery_level: None,
                 charging_state: None,
                 battery_range: None,
+            charge_rate: None,
                 charge_limit_soc: None,
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,
@@ -1497,6 +1683,7 @@ mod tests {
                 battery_level: None,
                 charging_state: None,
                 battery_range: None,
+            charge_rate: None,
                 charge_limit_soc: None,
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,
@@ -1539,6 +1726,7 @@ mod tests {
                 battery_level: None,
                 charging_state: None,
                 battery_range: None,
+            charge_rate: None,
                 charge_limit_soc: None,
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,
@@ -1581,6 +1769,7 @@ mod tests {
                 battery_level: Some(55),
                 charging_state: None,
                 battery_range: None,
+            charge_rate: None,
                 charge_limit_soc: Some(90),
                 charge_limit_soc_min: Some(50),
                 charge_limit_soc_max: Some(100),
@@ -1623,6 +1812,7 @@ mod tests {
                 battery_level: None,
                 charging_state: None,
                 battery_range: None,
+            charge_rate: None,
                 charge_limit_soc: Some(80),
                 charge_limit_soc_min: Some(50),
                 charge_limit_soc_max: Some(100),
@@ -1665,6 +1855,7 @@ mod tests {
                 battery_level: None,
                 charging_state: None,
                 battery_range: None,
+            charge_rate: None,
                 charge_limit_soc: Some(90),
                 charge_limit_soc_min: Some(50),
                 charge_limit_soc_max: Some(100),
@@ -1709,6 +1900,7 @@ mod tests {
                 battery_level: None,
                 charging_state: None,
                 battery_range: None,
+            charge_rate: None,
                 charge_limit_soc: Some(100),
                 charge_limit_soc_min: Some(50),
                 charge_limit_soc_max: Some(100),
@@ -1751,6 +1943,7 @@ mod tests {
                 battery_level: None,
                 charging_state: None,
                 battery_range: None,
+            charge_rate: None,
                 charge_limit_soc: Some(80),
                 charge_limit_soc_min: Some(50),
                 charge_limit_soc_max: Some(100),
@@ -1799,6 +1992,7 @@ mod tests {
                 battery_level: None,
                 charging_state: None,
                 battery_range: None,
+            charge_rate: None,
                 charge_limit_soc: None,
                 charge_limit_soc_min: None,
                 charge_limit_soc_max: None,
@@ -1852,6 +2046,7 @@ mod tests {
                 battery_level: None,
                 charging_state: None,
                 battery_range: None,
+            charge_rate: None,
                 charge_limit_soc: None,
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,
@@ -1929,6 +2124,7 @@ mod tests {
                 battery_level: Some(50),
                 charging_state: None,
                 battery_range: None,
+            charge_rate: None,
                 charge_limit_soc: None,
             charge_limit_soc_min: None,
             charge_limit_soc_max: None,

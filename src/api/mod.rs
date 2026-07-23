@@ -12,7 +12,9 @@ pub use charge_limit::{
     CHARGE_LIMIT_STEP, MAX_CHARGE_LIMIT_PERCENT, MIN_CHARGE_LIMIT_PERCENT,
 };
 pub use client::{needs_partner_registration, FleetClient};
-pub use commands::{ClimateAction, LockAction, WindowAction};
+pub use commands::{
+    is_actively_charging, ChargeAction, ClimateAction, LockAction, WindowAction,
+};
 pub use details::VehicleDetails;
 pub use temperature::{
     celsius_to_display, celsius_to_setting_display, clamp_setting_display, display_to_celsius,
