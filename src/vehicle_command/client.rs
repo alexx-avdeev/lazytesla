@@ -100,6 +100,32 @@ impl VehicleCommandClient {
         .await
     }
 
+    pub async fn charge_start(&mut self, vin: &str, access_token: &str) -> Result<()> {
+        self.send_charge_start_stop(vin, access_token, true).await
+    }
+
+    pub async fn charge_stop(&mut self, vin: &str, access_token: &str) -> Result<()> {
+        self.send_charge_start_stop(vin, access_token, false).await
+    }
+
+    async fn send_charge_start_stop(
+        &mut self,
+        vin: &str,
+        access_token: &str,
+        start: bool,
+    ) -> Result<()> {
+        self.fleet.wake_up(vin, access_token).await?;
+        let payload = charging::build_charge_start_stop_action(start)?;
+        self.send_domain_action(
+            vin,
+            access_token,
+            Domain::Infotainment,
+            payload,
+            ResponseKind::CarServer,
+        )
+        .await
+    }
+
     pub async fn vent_windows(&mut self, vin: &str, access_token: &str) -> Result<()> {
         self.send_window_action(vin, access_token, true).await
     }

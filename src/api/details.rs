@@ -12,6 +12,9 @@ pub struct VehicleDetails {
     pub battery_level: Option<u8>,
     pub charging_state: Option<String>,
     pub battery_range: Option<f64>,
+    /// Range added per hour while charging (miles/hour from Fleet API).
+    #[serde(default)]
+    pub charge_rate: Option<f64>,
     pub charge_limit_soc: Option<u8>,
     #[serde(default)]
     pub charge_limit_soc_min: Option<u8>,
@@ -72,6 +75,9 @@ pub struct ChargeStateRaw {
     pub charging_state: Option<String>,
     #[serde(default)]
     pub battery_range: Option<f64>,
+    /// Miles of range added per hour (Fleet `charge_state.charge_rate`).
+    #[serde(default)]
+    pub charge_rate: Option<f64>,
     #[serde(default)]
     pub charge_limit_soc: Option<u8>,
     #[serde(default)]
@@ -143,6 +149,7 @@ impl VehicleDetails {
                 .charge_state
                 .as_ref()
                 .and_then(|c| c.battery_range),
+            charge_rate: raw.charge_state.as_ref().and_then(|c| c.charge_rate),
             charge_limit_soc: raw
                 .charge_state
                 .as_ref()
@@ -368,6 +375,23 @@ mod tests {
 
         assert_eq!(details.driver_temp_setting, Some(72.0));
         assert_eq!(details.passenger_temp_setting, Some(72.0));
+    }
+
+    #[test]
+    fn parses_charge_rate() {
+        let raw: VehicleDataRaw = serde_json::from_value(serde_json::json!({
+            "vin": "5YJSA11111111111",
+            "charge_state": {
+                "charge_rate": 27.5,
+                "charging_state": "Charging"
+            }
+        }))
+        .unwrap();
+
+        let details = VehicleDetails::from_raw(raw);
+
+        assert!((details.charge_rate.unwrap() - 27.5).abs() < f64::EPSILON);
+        assert_eq!(details.charging_state.as_deref(), Some("Charging"));
     }
 
     #[test]
